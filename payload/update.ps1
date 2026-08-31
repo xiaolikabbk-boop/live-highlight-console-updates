@@ -103,7 +103,7 @@ try {
     $ManifestFile = Join-Path $ExtractDir 'update-manifest.json'
     $PayloadRoot = Join-Path $ExtractDir 'payload'
     if (-not (Test-Path -LiteralPath $ManifestFile) -or -not (Test-Path -LiteralPath $PayloadRoot)) { throw "更新包结构不完整。" }
-    $Manifest = Get-Content -LiteralPath $ManifestFile -Raw | ConvertFrom-Json
+    $Manifest = Get-Content -LiteralPath $ManifestFile -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$Manifest.version -ne $AvailableText) { throw "更新包版本与 GitHub 发布版本不一致。" }
 
     $State = [ordered]@{ from_version=$CurrentText; to_version=$AvailableText; created_at=(Get-Date).ToString('o'); backed_up_files=@(); added_files=@() }
