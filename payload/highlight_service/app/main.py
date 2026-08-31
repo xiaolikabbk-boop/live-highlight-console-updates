@@ -64,22 +64,32 @@ def github_update_status() -> dict[str, Any]:
         repository = str(config.get("repository") or "").strip()
         if repository.count("/") != 1 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./" for char in repository):
             raise ValueError("更新仓库地址无效")
-        response = httpx.get(
-            f"https://api.github.com/repos/{repository}/releases/latest",
-            headers={"Accept": "application/vnd.github+json", "User-Agent": "Live-Highlight-Web-Updater"},
-            timeout=20,
-            follow_redirects=True,
-        )
-        response.raise_for_status()
-        release = response.json()
-        available = str(release.get("tag_name") or "").strip().lstrip("vV")
+        release_url = f"https://github.com/{repository}/releases/latest"
+        try:
+            response = httpx.get(
+                f"https://api.github.com/repos/{repository}/releases/latest",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "Live-Highlight-Web-Updater"},
+                timeout=20,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            release = response.json()
+            available = str(release.get("tag_name") or "").strip().lstrip("vV")
+            release_url = str(release.get("html_url") or release_url)
+        except httpx.HTTPError:
+            response = httpx.get(
+                f"https://raw.githubusercontent.com/{repository}/main/payload/VERSION",
+                headers={"User-Agent": "Live-Highlight-Web-Updater"}, timeout=20, follow_redirects=True,
+            )
+            response.raise_for_status()
+            available = response.text.strip().lstrip("vV")
         current = current_app_version()
         return {
             "ok": True,
             "current_version": current,
             "available_version": available,
             "update_available": _version_parts(available) > _version_parts(current),
-            "release_url": str(release.get("html_url") or ""),
+            "release_url": release_url,
             "message": "发现新版本" if _version_parts(available) > _version_parts(current) else "当前已经是最新版本",
         }
     except (OSError, ValueError, json.JSONDecodeError, httpx.HTTPError) as exc:
