@@ -333,12 +333,18 @@ class MediaTools:
                     pass
         return removed, removed_bytes
 
-    def invalidate_timeline(self, path: Path) -> None:
+    def invalidate_timeline(self, path: Path) -> int:
         resolved = str(path.resolve())
         with self._timeline_lock:
             for key in [key for key in self._timeline_cache if key.startswith(resolved + "|")]:
                 self._timeline_cache.pop(key, None)
-        self._timeline_cache_path(resolved).unlink(missing_ok=True)
+        cache_path = self._timeline_cache_path(resolved)
+        try:
+            released = cache_path.stat().st_size
+            cache_path.unlink()
+            return released
+        except (FileNotFoundError, OSError):
+            return 0
 
     def _stream_timeline(
         self, path: Path, progress: Callable[[str], None] | None = None

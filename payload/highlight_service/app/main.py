@@ -1197,7 +1197,8 @@ def cleanup_segment(segment_id: int, payload: SegmentCleanupRequest) -> dict[str
     ]
     input_root = settings.input_dir.resolve()
     data_roots = [settings.output_dir.resolve(), settings.cache_dir.resolve(), settings.keyframe_dir.resolve()]
-    released = _unlink_cleanup_file(Path(segment["path"]), [input_root])
+    released = media.invalidate_timeline(Path(segment["path"]))
+    released += _unlink_cleanup_file(Path(segment["path"]), [input_root])
     released += _unlink_cleanup_file(settings.cache_dir / f"segment_{segment_id}.wav", data_roots)
     candidate_ids: list[int] = []
     cleared_candidate_ids: list[int] = []
