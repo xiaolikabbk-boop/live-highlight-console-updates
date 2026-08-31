@@ -1,0 +1,99 @@
+.candidate-output {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.candidate-output strong {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: #e8f1ff;
+  color: #1559ad;
+}
+
+.candidate-output small {
+  color: var(--muted);
+}
+
+.candidate-output.empty strong {
+  background: #f1f3f6;
+  color: #707887;
+}
+
+/* Override the generic empty-state panel: this is only a compact table value. */
+.candidate-output.empty {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.candidate-links {
+  margin-top: 5px;
+  font-size: 12px;
+  color: #42638e;
+}
+
+.source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 440px;
+}
+
+.source-chip {
+  display: inline-flex;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #edf4ff;
+  color: #285b9a;
+  font-size: 12px;
+}
+
+.status-chip {
+  display: inline-flex;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #e8f7ef;
+  color: #08734a;
+  font-size: 12px;
+}
+
+.status-chip.superseded,
+.status-chip.render_error {
+  background: #f1f3f6;
+  color: #707887;
+}
+
+.status-chip.deferred {
+  background: #fff3d9;
+  color: #956000;
+}
+
+.cleanup-cell {
+  min-width: 180px;
+}
+
+.compact {
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+
+.cleanup-message {
+  max-width: 280px;
+  margin-top: 6px;
+  color: #9b5a00;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.cleanup-done {
+  color: #08734a;
+  font-size: 12px;
+  font-weight: 700;
+}

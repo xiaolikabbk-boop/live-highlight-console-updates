@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>商品 ID 库</title><link rel="stylesheet" href="/static/app.css?v=20260812-3"></head>
+<body>
+  <header class="topbar"><div><h1>商品 ID 库</h1><p>审核时人工搜索并确认投放对象</p></div><nav><a href="/">直播间</a><a href="/review">素材审核</a><a href="/publish">人工交接</a><a href="/catalog">商品 ID 库</a></nav></header>
+  <main>
+    <section class="catalog-tools">
+      <form method="get"><input name="q" value="{{ q }}" placeholder="搜索款号、名称或别名"><button>搜索</button></form>
+      <form id="import-form"><input type="file" name="file" accept=".xlsx,.csv" required><button class="secondary">导入 Excel/CSV</button></form>
+      <a class="button secondary" href="/api/catalog/export">导出 Excel</a>
+    </section>
+    <section class="catalog-form">
+      <h2>新增或更新款号</h2>
+      <div class="form-grid">
+        <label>自定义款号<input id="code" required></label><label>商品名称<input id="name" required></label>
+        <label>别名<input id="aliases" placeholder="逗号分隔"></label><label>千川商品 ID<input id="product_id"></label>
+        <label>千川计划 ID<input id="plan_id"></label><label>参考图片路径<input id="images"></label>
+        <label class="wide">备注<input id="notes"></label>
+      </div><button class="primary" onclick="saveCatalog()">保存款号</button><span id="save-message"></span>
+    </section>
+    <div class="table-wrap"><table><thead><tr><th>款号</th><th>名称</th><th>别名</th><th>千川商品 ID</th><th>千川计划 ID</th><th>使用情况</th><th>操作</th></tr></thead><tbody>
+      {% for item in items %}<tr id="catalog-row-{{ item.id }}"><td>{{ item.internal_code }}</td><td>{{ item.name }}</td><td>{{ item.aliases }}</td><td>{{ item.qianchuan_product_id }}</td><td>{{ item.qianchuan_plan_id }}</td><td>{{ item.room_uses }}个直播间 · {{ item.segment_uses }}个分片 · {{ item.candidate_uses }}条候选 · {{ item.handoff_uses }}次交接</td><td><button class="danger" onclick="deleteCatalog({{ item.id }},{{ item.room_uses }},{{ item.segment_uses }},{{ item.candidate_uses }},{{ item.handoff_uses }},{{ item.review_uses }})">删除</button></td></tr>{% endfor %}
+    </tbody></table></div>
+  </main>
+  <script>
+    async function saveCatalog(){
+      const get=(id)=>document.getElementById(id).value;
+      const body={internal_code:get('code'),name:get('name'),aliases:get('aliases'),qianchuan_product_id:get('product_id'),qianchuan_plan_id:get('plan_id'),reference_images:get('images'),notes:get('notes'),active:true};
+      const r=await fetch('/api/catalog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const d=await r.json();
+      document.getElementById('save-message').textContent=r.ok?'保存成功':(d.detail||'保存失败'); if(r.ok)setTimeout(()=>location.reload(),500);
+    }
+    document.getElementById('import-form').addEventListener('submit',async(e)=>{e.preventDefault();const r=await fetch('/api/catalog/import',{method:'POST',body:new FormData(e.target)});const d=await r.json();alert(r.ok?`已导入 ${d.imported} 条`:(d.detail||'导入失败'));if(r.ok)location.reload();});
+    async function deleteCatalog(id,rooms,segments,candidates,handoffs,reviews){const row=document.getElementById(`catalog-row-${id}`),code=row?.cells[0]?.textContent||id,used=rooms+segments+candidates+handoffs+reviews>0;const warning=used?`该款号关联 ${rooms} 个直播间、${segments} 个历史分片、${candidates} 条候选、${handoffs} 次交接和 ${reviews} 条审核记录。\n\n继续会彻底删除这些测试候选、审核与交接任务，并清除本地测试包，同时解除直播间绑定。操作不能撤销。`:'该款号没有关联记录，将直接删除。';if(!confirm(`确认删除款号 ${code}？\n\n${warning}`))return;const r=await fetch(`/api/catalog/${id}?purge_history=${used?'true':'false'}`,{method:'DELETE'});const d=await r.json();if(!r.ok){alert(d.detail||'删除失败');return}row?.remove();alert(d.message+(d.released_mb?`，释放 ${d.released_mb}MB`:''));}
+  </script>
+</body></html>

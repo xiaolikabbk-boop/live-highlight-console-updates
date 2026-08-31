@@ -1,0 +1,153 @@
+﻿$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$VersionFile = Join-Path $Root "VERSION"
+$ConfigFile = Join-Path $Root "update-config.json"
+$UpdateRoot = Join-Path $Root "_update"
+$BackupRoot = Join-Path $UpdateRoot "backups"
+$LogRoot = Join-Path $UpdateRoot "logs"
+$PidFile = Join-Path $Root "highlight_service\data\service.pid"
+
+function Convert-Version([string]$Value) {
+    try { return [version]($Value.Trim().TrimStart('v','V')) }
+    catch { return [version]"0.0.0.0" }
+}
+
+function Normalize-RelativePath([string]$Value) {
+    $Path = $Value.Replace('/', '\').TrimStart('\')
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Contains('..') -or [IO.Path]::IsPathRooted($Path) -or $Path.Contains(':')) {
+        throw "更新清单包含不安全路径：$Value"
+    }
+    return $Path
+}
+
+function Test-AllowedUpdatePath([string]$Relative) {
+    if ($Relative.StartsWith('highlight_service\app\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $AllowedRootFiles = @(
+        'VERSION', 'start_console.ps1', '启动直播录制剪辑中控台.bat', '使用说明.txt',
+        '检查并安装更新.bat', '回滚上一个版本.bat',
+        'update.ps1', 'rollback_update.ps1'
+    )
+    return $AllowedRootFiles -contains $Relative
+}
+
+function Assert-UnderRoot([string]$Path, [string]$Base) {
+    $resolvedBase = [IO.Path]::GetFullPath($Base).TrimEnd('\') + '\'
+    $resolved = [IO.Path]::GetFullPath($Path)
+    if (-not $resolved.StartsWith($resolvedBase, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "路径越界：$resolved"
+    }
+}
+
+function Restore-Backup($State, [string]$BackupDir) {
+    foreach ($Relative in @($State.added_files)) {
+        $Target = Join-Path $Root ([string]$Relative)
+        Assert-UnderRoot $Target $Root
+        if (Test-Path -LiteralPath $Target -PathType Leaf) { Remove-Item -LiteralPath $Target -Force }
+    }
+    foreach ($Relative in @($State.backed_up_files)) {
+        $Source = Join-Path (Join-Path $BackupDir 'files') ([string]$Relative)
+        $Target = Join-Path $Root ([string]$Relative)
+        Assert-UnderRoot $Target $Root
+        $Parent = Split-Path -Parent $Target
+        if (-not (Test-Path -LiteralPath $Parent)) { New-Item -ItemType Directory -Path $Parent -Force | Out-Null }
+        Copy-Item -LiteralPath $Source -Destination $Target -Force
+    }
+}
+
+Write-Host "==============================================="
+Write-Host "  直播录制剪辑中控台 - 安全更新"
+Write-Host "==============================================="
+if (-not (Test-Path -LiteralPath $ConfigFile)) { throw "缺少 update-config.json。" }
+$Config = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
+$Repository = [string]$Config.repository
+$AssetName = [string]$Config.asset_name
+$CurrentText = if (Test-Path -LiteralPath $VersionFile) { (Get-Content -LiteralPath $VersionFile -Raw).Trim() } else { "0.0.0.0" }
+Write-Host "当前版本：$CurrentText" -ForegroundColor Cyan
+
+if (Test-Path -LiteralPath $PidFile) {
+    $PidText = (Get-Content -LiteralPath $PidFile -Raw).Trim()
+    if ($PidText -match '^\d+$' -and (Get-Process -Id ([int]$PidText) -ErrorAction SilentlyContinue)) {
+        Write-Host "检测到中控台仍在运行。为避免打断转写或渲染，请先关闭黑色中控台窗口，再重新运行本更新程序。" -ForegroundColor Yellow
+        exit 2
+    }
+}
+
+$Headers = @{ 'Accept'='application/vnd.github+json'; 'User-Agent'='Live-Highlight-Updater'; 'X-GitHub-Api-Version'='2022-11-28' }
+$ReleaseUri = "https://api.github.com/repos/$Repository/releases/latest"
+try { $Release = Invoke-RestMethod -Uri $ReleaseUri -Headers $Headers -Method Get -TimeoutSec 30 }
+catch { throw "无法读取 GitHub 更新信息。请检查网络、仓库地址或更新权限。$($_.Exception.Message)" }
+$AvailableText = ([string]$Release.tag_name).TrimStart('v','V')
+Write-Host "可用版本：$AvailableText" -ForegroundColor Cyan
+if ((Convert-Version $AvailableText) -le (Convert-Version $CurrentText)) {
+    Write-Host "当前已经是最新版本，无需更新。" -ForegroundColor Green
+    exit 0
+}
+$Asset = @($Release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+if ($null -eq $Asset) { throw "最新版本没有找到更新包 $AssetName。" }
+$Answer = Read-Host "发现新版本。输入 YES 下载、备份并安装"
+if ($Answer -ne 'YES') { Write-Host "已取消更新。"; exit 0 }
+
+New-Item -ItemType Directory -Path $UpdateRoot,$BackupRoot,$LogRoot -Force | Out-Null
+$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$WorkDir = Join-Path $UpdateRoot ("work_" + $Stamp)
+$ArchiveFile = Join-Path $WorkDir $AssetName
+$ExtractDir = Join-Path $WorkDir "extracted"
+$BackupDir = Join-Path $BackupRoot ($CurrentText + '_before_' + $AvailableText + '_' + $Stamp)
+New-Item -ItemType Directory -Path $WorkDir,$ExtractDir,(Join-Path $BackupDir 'files') -Force | Out-Null
+Assert-UnderRoot $WorkDir $UpdateRoot
+
+try {
+    Write-Host "正在下载更新包……"
+    Invoke-WebRequest -Uri ([string]$Asset.browser_download_url) -Headers @{ 'User-Agent'='Live-Highlight-Updater' } -OutFile $ArchiveFile -UseBasicParsing -TimeoutSec 180
+    Expand-Archive -LiteralPath $ArchiveFile -DestinationPath $ExtractDir -Force
+    $ManifestFile = Join-Path $ExtractDir 'update-manifest.json'
+    $PayloadRoot = Join-Path $ExtractDir 'payload'
+    if (-not (Test-Path -LiteralPath $ManifestFile) -or -not (Test-Path -LiteralPath $PayloadRoot)) { throw "更新包结构不完整。" }
+    $Manifest = Get-Content -LiteralPath $ManifestFile -Raw | ConvertFrom-Json
+    if ([string]$Manifest.version -ne $AvailableText) { throw "更新包版本与 GitHub 发布版本不一致。" }
+
+    $State = [ordered]@{ from_version=$CurrentText; to_version=$AvailableText; created_at=(Get-Date).ToString('o'); backed_up_files=@(); added_files=@() }
+    $Validated = @()
+    foreach ($File in @($Manifest.files)) {
+        $Relative = Normalize-RelativePath ([string]$File.path)
+        if (-not (Test-AllowedUpdatePath $Relative)) { throw "更新包试图修改受保护内容：$Relative" }
+        $Source = Join-Path $PayloadRoot $Relative
+        Assert-UnderRoot $Source $PayloadRoot
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "更新包缺少文件：$Relative" }
+        $ActualHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($ActualHash -ne ([string]$File.sha256).ToLowerInvariant()) { throw "文件校验失败：$Relative" }
+        $Validated += [pscustomobject]@{ Relative=$Relative; Source=$Source }
+    }
+    if ($Validated.Count -eq 0) { throw "更新包没有可安装文件。" }
+
+    foreach ($Item in $Validated) {
+        $Target = Join-Path $Root $Item.Relative
+        Assert-UnderRoot $Target $Root
+        if (Test-Path -LiteralPath $Target -PathType Leaf) {
+            $BackupFile = Join-Path (Join-Path $BackupDir 'files') $Item.Relative
+            $BackupParent = Split-Path -Parent $BackupFile
+            if (-not (Test-Path -LiteralPath $BackupParent)) { New-Item -ItemType Directory -Path $BackupParent -Force | Out-Null }
+            Copy-Item -LiteralPath $Target -Destination $BackupFile -Force
+            $State.backed_up_files += $Item.Relative
+        } else { $State.added_files += $Item.Relative }
+    }
+    $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $BackupDir 'update-state.json') -Encoding UTF8
+    foreach ($Item in $Validated) {
+        $Target = Join-Path $Root $Item.Relative
+        $TargetParent = Split-Path -Parent $Target
+        if (-not (Test-Path -LiteralPath $TargetParent)) { New-Item -ItemType Directory -Path $TargetParent -Force | Out-Null }
+        Copy-Item -LiteralPath $Item.Source -Destination $Target -Force
+    }
+    Write-Host "更新完成：$CurrentText -> $AvailableText" -ForegroundColor Green
+    Write-Host "直播间、密钥、数据库、录像、素材、模型和导出记录均未触碰。" -ForegroundColor Green
+}
+catch {
+    if ($null -ne $State -and (Test-Path -LiteralPath $BackupDir)) {
+        Write-Host "安装失败，正在自动恢复更新前版本……" -ForegroundColor Yellow
+        Restore-Backup $State $BackupDir
+    }
+    throw
+}
+finally {
+    if (Test-Path -LiteralPath $WorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
+}

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ room.name }}</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260813-1">
+  <link rel="stylesheet" href="/static/dashboard.css?v=20260812-5">
+  <link rel="stylesheet" href="/static/room.css?v=20260813-1">
+</head>
+<body>
+<header class="topbar">
+  <div><h1>{{ room.sequence }} · {{ room.name }}</h1><p>{{ room.state }} · {{ room.url }}</p></div>
+  <nav><a href="/">直播间</a><a href="/review?room_id={{ room.id }}">素材审核</a><a href="/export?room_id={{ room.id }}">成片导出</a></nav>
+</header>
+<main>
+  <section class="summary-grid">
+    <div class="summary"><b>{{ room.segment_total }}</b><span>录像分片</span></div>
+    <div class="summary"><b>{{ room.segment_transcribed }}</b><span>已转写</span></div>
+    <div class="summary"><b>{{ room.segment_model_submitted }}</b><span>已提交模型</span></div>
+    <div class="summary"><b>{{ room.segment_analyzed }}</b><span>分析完成</span></div>
+    <div class="summary"><b>{{ room.segment_yielded }}</b><span>有产出分片</span></div>
+    <div class="summary"><b>{{ room.candidate_total }}</b><span>候选素材</span></div>
+    <div class="summary"><b>{{ room.effective_count }}</b><span>有效素材</span></div>
+  </section>
+
+  <h2>最近录像分片</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>场次</th><th>时长</th><th>处理阶段</th><th>转写</th><th>提交模型</th><th>分析完成</th><th>候选产出</th><th>文件</th><th>空间清理</th><th>时间</th></tr></thead>
+      <tbody>
+      {% for s in segments %}
+        <tr>
+          <td>#{{ s.id }}</td><td>{{ s.session_id }}</td><td>{{ '%.1f'|format(s.duration) }}秒</td><td>{{ s.stage_label }}</td>
+          <td>{{ '是' if s.transcribed_at else '否' }}</td><td>{{ '是' if s.model_submitted_at else '否' }}</td><td>{{ '是' if s.analyzed_at else '否' }}</td>
+          <td>
+            {% if s.candidate_count %}
+              <div class="candidate-output"><strong>{{ s.candidate_count }}条</strong><small>GPT {{ s.gpt_candidate_count }} · 补漏 {{ s.deepseek_candidate_count }}</small></div>
+              <div class="candidate-links">候选 {% for id in s.candidate_ids %}#{{ id }}{% if not loop.last %}、{% endif %}{% endfor %}</div>
+            {% elif s.analyzed_at %}
+              <div class="candidate-output empty"><strong>0条</strong><small>模型未产出可用候选</small></div>
+            {% else %}—{% endif %}
+          </td>
+          <td title="{{ s.path }}">{{ s.filename }}</td>
+          <td class="cleanup-cell">
+            {% if s.cleanup_already_cleaned %}<span class="cleanup-done">已清理 · 释放 {{ '%.2f'|format(s.released_bytes/1024/1024/1024) }}GB</span>
+            {% elif s.cleanup_cleanable %}<button class="danger compact" onclick="cleanupSegment({{ s.id }},this)">安全清理 · 约{{ s.cleanup_estimated_gb }}GB</button>
+            {% else %}<button class="secondary compact" onclick="showCleanupBlockers({{ s.id }},this)">暂不可清理</button>{% endif %}
+            <div class="cleanup-message" id="cleanup-message-{{ s.id }}"></div>
+          </td>
+          <td>{{ s.created_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>最近候选</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>模型</th><th>状态</th><th>来源分片</th><th>源时间</th><th>更新时间</th></tr></thead>
+      <tbody>
+      {% for c in candidates %}
+        <tr>
+          <td><a href="/review?room_id={{ room.id }}#candidate-{{ c.id }}">#{{ c.id }}</a></td>
+          <td>{{ 'DeepSeek补漏' if 'deepseek' in c.analysis_version else 'GPT主选' }}</td>
+          <td><span class="status-chip {{ c.status }}">{{ {'pending_review':'待审核','deferred':'暂存待用','accepted':'已接受','rejected':'不需要','exported':'已打包','superseded':'已作废','render_error':'渲染异常'}.get(c.status,c.status) }}</span></td>
+          <td><div class="source-list">{% for source in c.source_segments %}<span class="source-chip">#{{ source.id }} · {{ source.filename }}</span>{% else %}<span>未找到来源</span>{% endfor %}</div></td>
+          <td>{{ '%.3f'|format(c.start_time) }}–{{ '%.3f'|format(c.end_time) }}</td><td>{{ c.updated_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</main>
+<script>
+function cleanupError(detail){if(typeof detail==='string')return detail;if(detail?.message)return detail.message;if(Array.isArray(detail?.blockers))return detail.blockers.join('；');return '操作失败'}
+async function showCleanupBlockers(id,button){const box=document.getElementById(`cleanup-message-${id}`);button.disabled=true;const res=await fetch(`/api/segments/${id}/cleanup-check`);const data=await res.json();button.disabled=false;if(!res.ok){box.textContent=cleanupError(data.detail);return}box.textContent=data.blockers.length?data.blockers.join('；'):'当前已满足清理条件，请刷新页面';}
+async function cleanupSegment(id,button){const check=await fetch(`/api/segments/${id}/cleanup-check`).then(r=>r.json());if(!check.cleanable){document.getElementById(`cleanup-message-${id}`).textContent=(check.blockers||[]).join('；');return}if(!confirm(`将删除该分片的原始录像、候选预览、关键帧和临时缓存，预计释放 ${check.estimated_gb}GB。\n\n已导出的成片、审核记录和文字数据会保留。确认继续？`))return;const box=document.getElementById(`cleanup-message-${id}`);button.disabled=true;box.textContent='正在安全清理…';const res=await fetch(`/api/segments/${id}/cleanup`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});const data=await res.json();if(!res.ok){button.disabled=false;box.textContent=cleanupError(data.detail);return}box.textContent=`清理完成，释放 ${data.released_gb}GB`;setTimeout(()=>location.reload(),700)}
+</script>
+</body>
+</html>

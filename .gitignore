@@ -1,0 +1,25 @@
+# Never commit local/user state
+**/.env
+**/.env.*
+**/data/
+**/config/
+**/runtime/
+**/models/
+**/downloads/
+**/outputs/
+**/logs/
+**/backup_config/
+**/_update/
+**/update-token.dat
+*.db
+*.db-*
+*.sqlite*
+*.mp4
+*.ts
+*.mkv
+*.mov
+*.zip
+*.log
+__pycache__/
+*.pyc
+

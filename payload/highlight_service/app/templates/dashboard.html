@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>直播录制剪辑中控台</title><link rel="stylesheet" href="/static/app.css?v=20260812-3"><link rel="stylesheet" href="/static/dashboard.css?v=20260831-10"></head>
+<body>
+<header class="topbar"><div><h1>直播录制剪辑中控台</h1><p>直播间监控 · 10分钟分片 · 分阶段排队 · 人工审核 · 当前版本 {{ app_version }}</p></div>
+<nav><a href="/">直播间</a><a href="/review">素材审核</a><a href="/export">成片导出</a></nav></header>
+<main>
+  <section class="summary-grid control-summary">
+    <div class="summary"><b>{{ totals.rooms }}</b><span>直播间</span></div><div class="summary"><b>{{ totals.recording }}</b><span>正在直播</span></div><div class="summary"><b>{{ totals.active_recordings }}</b><span>正在录制</span></div>
+    <div class="summary"><b>{{ totals.segments }}</b><span>已完成分片</span></div><div class="summary"><b>{{ totals.transcribed }}</b><span>已转写</span></div>
+    <div class="summary"><b>{{ totals.model_submitted }}</b><span>已提交模型</span></div><div class="summary"><b>{{ totals.analyzed }}</b><span>分析完成</span></div>
+    <div class="summary"><b>{{ totals.yielded }}</b><span>有产出分片</span></div><div class="summary"><b>{{ totals.candidates }}</b><span>候选素材</span></div>
+    <div class="summary"><b>{{ totals.pending }}</b><span>待审核</span></div><div class="summary"><b>{{ totals.effective }}</b><span>人工确认有效</span></div>
+  </section>
+  <section class="control-strip"><span class="status-dot {{ 'on' if recorder_running else 'off' }}"></span>录制器 {{ '运行中' if recorder_running else '未运行' }} · GPT {{ '已配置' if cloud_text else '未配置' }} · DeepSeek {{ '已启用' if deepseek_supplement else '未启用' }}<button class="secondary batch-room-open" onclick="showBatchRoomForm()">批量核对直播间</button><a class="button secondary" href="/api/rooms/export">导出直播间</a><button class="secondary" onclick="$('room-import-file').click()">导入直播间</button><input id="room-import-file" type="file" accept=".json,application/json" hidden onchange="importRooms(this)"><button class="primary" onclick="newRoom()">＋ 新增直播间</button></section>
+  <section class="room-filter-panel">
+    <label class="room-search-filter"><span>搜索直播间</span><input id="room-filter-search" type="search" placeholder="输入序号、名称或链接" oninput="applyRoomFilters()"></label>
+    <label><span>直播状态</span><select id="room-filter-live" onchange="applyRoomFilters()"><option value="all">全部状态</option><option value="live">正在直播</option><option value="offline">未开播</option><option value="unknown">状态未知/检测中</option></select></label>
+    <label><span>录制状态</span><select id="room-filter-recording" onchange="applyRoomFilters()"><option value="all">全部录制状态</option><option value="enabled">录制开关已开</option><option value="paused">录制已暂停</option><option value="active">正在录制文件</option></select></label>
+    <button class="secondary" type="button" onclick="clearRoomFilters()">清除筛选</button><strong id="room-filter-count">显示 {{ totals.rooms }} 个直播间</strong>
+  </section>
+  <section class="scheduler-strip">
+    {% for stage in processing_health %}<article class="stage-health stage-{{ stage.state }}">
+      <header><b>{{ stage.title }} · 单路</b><span class="stage-state"><i></i>{{ stage.state_label }}</span></header>
+      <p class="stage-current">{{ stage.current }}</p>
+      <div class="stage-facts"><span>队列等待 <b>{{ stage.waiting }}</b></span><span>本项已运行 <b>{{ stage.elapsed }}</b></span></div>
+      <p class="stage-last">最近完成：{{ stage.last_completed }}</p><small>{{ stage.hint }}</small>
+    </article>{% endfor %}
+    <p class="scheduler-note">页面每30秒自动自检。不同直播间轮流处理；单路运行用于避免CPU、硬盘和模型请求同时过载。</p>
+  </section>
+  <details class="runtime-log"><summary>运行日志与当前录制情况</summary><div class="runtime-log-body">
+    {% for room in rooms %}<p><b>{{ room.sequence }} · {{ room.name }}</b>：{% if room.recording_active %}<span class="log-good">正在录制，已录 {{ room.active_elapsed_text }}，{{ room.active_size_mb }} MB，文件持续写入</span>{% elif room.enabled and room.live_state == 'live' %}<span class="log-wait">直播中，已开启录制，等待录制器建立文件</span>{% elif room.enabled %}已开启录制，当前未开播{% else %}录制暂停；静默状态检测仍在运行{% endif %}</p>{% endfor %}
+    {% for event in recent_events %}<p class="event-line"><time>{{ event.created_at }}</time> {{ event.message }}</p>{% endfor %}
+  </div></details>
+  <section id="room-form" class="room-modal hidden" role="dialog" aria-modal="true" aria-labelledby="room-form-title" onclick="if(event.target===this)hideRoomForm()"><div class="room-dialog">
+    <h2 id="room-form-title">新增直播间</h2><input type="hidden" id="room-id">
+    <div class="form-grid">
+      <label>管理序号<input value="保存时自动生成" disabled></label><label>直播间名称 *<input id="room-name"></label>
+      <label class="wide">抖音直播间链接 *<input id="room-url" placeholder="https://live.douyin.com/..."></label>
+      <label class="wide">备注<input id="room-notes"></label><label class="check"><input type="checkbox" id="room-enabled" checked> 启用自动监控</label>
+    </div><div class="actions room-form-actions"><button class="primary" onclick="saveRoom()">保存直播间</button><button class="secondary" onclick="hideRoomForm()">取消</button><span id="room-message"></span></div>
+  </div></section>
+  <section id="room-batch-form" class="room-modal hidden" role="dialog" aria-modal="true" aria-labelledby="room-batch-title" onclick="if(event.target===this)hideBatchRoomForm()"><div class="room-dialog batch-room-dialog">
+    <h2 id="room-batch-title">批量核对并添加直播间</h2>
+    <p class="batch-room-help">按“直播间名称一行、直播间链接一行”粘贴，可一次放入多个直播间。先核对，已有直播间不会重复添加。</p>
+    <textarea id="room-batch-text" rows="12" placeholder="增致牛仔男装旗舰店&#10;https://live.douyin.com/123456&#10;另一个直播间&#10;https://v.douyin.com/xxxxxx/"></textarea>
+    <label class="batch-room-enabled"><input type="checkbox" id="room-batch-enabled" checked> 新增直播间立即启用自动监控</label>
+    <div id="room-batch-summary" class="batch-room-summary hidden"></div>
+    <div id="room-batch-results" class="batch-room-results hidden"></div>
+    <div class="actions room-form-actions"><button class="primary" onclick="checkBatchRooms()">核对列表</button><button id="room-batch-add" class="export hidden" onclick="addBatchRooms()">添加未收录直播间</button><button class="secondary" onclick="hideBatchRoomForm()">关闭</button><span id="room-batch-message"></span></div>
+  </div></section>
+  <section class="room-grid">
+  {% for room in rooms %}<article class="room-card" data-room-search="{{ room.sequence }} {{ room.name }} {{ room.url }}" data-live-state="{{ room.live_state }}" data-recording-state="{{ room.recording_state }}" data-recording-enabled="{{ 1 if room.enabled else 0 }}">
+    <div class="room-head"><div><span class="room-seq">{{ room.sequence }}</span><h2>{{ room.name }}</h2></div><div class="room-badges"><span class="live-badge live-{{ room.live_state }}"><i></i>{{ room.live_label }}</span><span class="record-badge record-{{ room.recording_state }}">{{ room.recording_label }}</span><span class="process-badge process-{{ room.processing_state }}">{{ room.processing_label }}</span></div></div>
+    <p class="room-url" title="{{ room.url }}">{{ room.url }}</p>
+    {% if room.notes %}<div class="binding"><b>备注</b><span>{{ room.notes }}</span></div>{% endif %}
+    <div class="stage-queue"><span>待转写 <b>{{ room.waiting_asr }}</b>{% if room.active_asr %} · 转写中{% endif %}</span><span>待模型 <b>{{ room.waiting_ai }}</b>{% if room.active_ai %} · 分析中{% endif %}</span><span>待渲染 <b>{{ room.waiting_render }}</b>{% if room.active_render %} · 渲染中{% endif %}</span></div>
+    {% if room.recording_active %}<div class="recording-progress"><div><b>正在录制 {{ room.active_elapsed_text }}</b><span>{{ room.active_size_mb }} MB</span></div><div class="progress-track"><i style="width:{{ room.active_progress }}%"></i></div><small>{% if room.active_progress < 100 %}距下一条10分钟分片约 {{ room.active_remaining_text }}{% else %}已到分片时间，等待录制器关闭文件{% endif %} · {{ room.active_file }}</small></div>{% elif room.enabled and room.live_state == 'live' %}<div class="recording-wait">直播中，录制开关已打开，正在等待录制器建立文件</div>{% endif %}
+    <div class="metric-grid"><div><b>{{ room.segment_total }}</b><span>已完成分片</span></div><div><b>{{ room.segment_transcribed }}</b><span>已转写</span></div><div><b>{{ room.segment_model_submitted }}</b><span>已提交模型</span></div><div><b>{{ room.segment_analyzed }}</b><span>分析完成</span></div><div><b>{{ room.segment_yielded }}</b><span>有产出分片</span></div><div><b>{{ room.candidate_total }}</b><span>候选素材</span></div><div><b>{{ room.pending_review }}</b><span>待审核</span></div><div><b>{{ room.effective_count }}</b><span>有效素材</span></div></div>
+    {% if room.segment_errors %}<p class="error-text">异常分片 {{ room.segment_errors }} 个{% if room.last_error %} · {{ room.last_error }}{% endif %}</p>{% endif %}
+    <p class="timestamps">状态检测：{{ room.live_checked_at or '等待首次检测' }}{% if room.live_check_error %}<br><span class="status-hint">{{ room.live_check_error }}</span>{% endif %}<br>最近录像：{{ room.last_recording_at or '暂无' }}<br>最近处理：{{ room.last_processed_at or '暂无' }}</p>
+    <div class="actions"><a class="button {{ 'live-open' if room.live_state == 'live' else 'secondary' }}" href="{{ room.url }}" target="_blank" rel="noopener noreferrer">{{ '观看直播' if room.live_state == 'live' else '打开抖音页' }}</a><a class="button secondary" href="/rooms/{{ room.id }}">查看详情</a><a class="button secondary" href="/review?room_id={{ room.id }}">进入审核</a><button class="secondary" onclick="editRoom({{ room.id }})">编辑</button><button class="{{ 'danger' if room.enabled else 'primary' }}" onclick="toggleRoom({{ room.id }},{{ 'false' if room.enabled else 'true' }})">{{ '暂停录制' if room.enabled else '开始录制' }}</button><button class="secondary" onclick="archiveRoom({{ room.id }})">归档（保留历史）</button><button class="danger" onclick="deleteRoom({{ room.id }})">删除</button></div>
+  </article>{% else %}<div class="empty"><h2>还没有直播间</h2><p>点击“新增直播间”，录制器会在下一轮自动开始监控。</p></div>{% endfor %}
+    <div id="room-filter-empty" class="empty hidden"><h2>没有符合筛选条件的直播间</h2><p>可以更换状态、修改关键词或清除筛选。</p></div>
+  </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);function showRoomForm(){$('room-form').classList.remove('hidden');document.body.classList.add('modal-open')}function hideRoomForm(){$('room-form').classList.add('hidden');document.body.classList.remove('modal-open');$('room-message').textContent=''}
+function errorText(detail){if(typeof detail==='string')return detail;if(Array.isArray(detail))return detail.map(item=>item.msg||item.message||JSON.stringify(item)).join('；');if(detail&&typeof detail==='object')return detail.msg||detail.message||JSON.stringify(detail);return '操作失败'}
+function escapeHtml(value){return String(value).replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]))}
+function showBatchRoomForm(){$('room-batch-form').classList.remove('hidden');document.body.classList.add('modal-open');$('room-batch-text').focus()}
+function hideBatchRoomForm(){$('room-batch-form').classList.add('hidden');document.body.classList.remove('modal-open');$('room-batch-message').textContent=''}
+const roomFilterStorageKey='live-highlight-room-filters-v1';
+function roomFilterValues(){return {search:$('room-filter-search').value.trim(),live:$('room-filter-live').value,recording:$('room-filter-recording').value}}
+function saveRoomFilters(){try{localStorage.setItem(roomFilterStorageKey,JSON.stringify(roomFilterValues()))}catch(error){}}
+function applyRoomFilters(){const filters=roomFilterValues(),query=filters.search.toLocaleLowerCase(),cards=[...document.querySelectorAll('.room-card')];let visible=0;for(const card of cards){const text=(card.dataset.roomSearch||'').toLocaleLowerCase(),live=card.dataset.liveState||'unknown',recording=card.dataset.recordingState||'paused',enabled=card.dataset.recordingEnabled==='1';const searchMatch=!query||text.includes(query);const liveMatch=filters.live==='all'||(filters.live==='unknown'?!['live','offline'].includes(live):live===filters.live);const recordingMatch=filters.recording==='all'||(filters.recording==='enabled'&&enabled)||(filters.recording==='paused'&&!enabled)||(filters.recording==='active'&&recording==='active');const show=searchMatch&&liveMatch&&recordingMatch;card.classList.toggle('filter-hidden',!show);if(show)visible++}$('room-filter-count').textContent=`显示 ${visible} / ${cards.length} 个直播间`;$('room-filter-empty').classList.toggle('hidden',visible>0||cards.length===0);saveRoomFilters()}
+function clearRoomFilters(){$('room-filter-search').value='';$('room-filter-live').value='all';$('room-filter-recording').value='all';applyRoomFilters()}
+function restoreRoomFilters(){try{const saved=JSON.parse(localStorage.getItem(roomFilterStorageKey)||'{}');$('room-filter-search').value=typeof saved.search==='string'?saved.search:'';if([...$('room-filter-live').options].some(option=>option.value===saved.live))$('room-filter-live').value=saved.live;if([...$('room-filter-recording').options].some(option=>option.value===saved.recording))$('room-filter-recording').value=saved.recording}catch(error){}applyRoomFilters()}
+function renderBatchRoomResult(data){$('room-batch-summary').textContent=`共 ${data.total} 个：未收录 ${data.new_count} 个，已存在 ${data.existing_count} 个，本次重复 ${data.duplicate_count} 个，格式有误 ${data.invalid_count} 个`;$('room-batch-summary').classList.remove('hidden');$('room-batch-results').innerHTML=`<table><thead><tr><th>#</th><th>直播间名称</th><th>链接</th><th>核对结果</th></tr></thead><tbody>${data.items.map(item=>`<tr><td>${item.index}</td><td>${escapeHtml(item.name)}</td><td class="batch-room-url">${escapeHtml(item.url||'—')}</td><td><span class="batch-status ${item.status}">${escapeHtml(item.status_label)}</span>${item.reason?`<small>${escapeHtml(item.reason)}</small>`:''}</td></tr>`).join('')}</tbody></table>`;$('room-batch-results').classList.remove('hidden');$('room-batch-add').textContent=`添加 ${data.new_count} 个未收录直播间`;$('room-batch-add').classList.toggle('hidden',!data.new_count)}
+async function checkBatchRooms(){const text=$('room-batch-text').value.trim(),message=$('room-batch-message');if(!text){message.textContent='请先粘贴直播间名称和链接';return}message.textContent='正在核对…';const r=await fetch('/api/rooms/batch-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,enabled:$('room-batch-enabled').checked})});const d=await r.json();if(!r.ok){message.textContent=errorText(d.detail);return}renderBatchRoomResult(d);message.textContent='核对完成'}
+async function addBatchRooms(){const text=$('room-batch-text').value.trim(),enabled=$('room-batch-enabled').checked,message=$('room-batch-message');if(!confirm('只会添加核对结果中标记为“未收录”的直播间，已有和重复项会跳过。是否继续？'))return;message.textContent='正在添加并同步录制器…';$('room-batch-add').disabled=true;const r=await fetch('/api/rooms/batch-add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,enabled})});const d=await r.json();if(!r.ok){message.textContent=errorText(d.detail);$('room-batch-add').disabled=false;return}renderBatchRoomResult(d);message.textContent=`添加完成：新增 ${d.created} 个直播间`;setTimeout(()=>location.reload(),900)}
+function newRoom(){$('room-form-title').textContent='新增直播间';$('room-id').value='';$('room-name').value='';$('room-url').value='';$('room-notes').value='';$('room-enabled').checked=true;showRoomForm()}
+async function editRoom(id){let res=await fetch(`/api/rooms/${id}`),data=await res.json();if(!res.ok){alert(data.detail||'读取失败');return}let r=data.room;showRoomForm();$('room-form-title').textContent=`编辑直播间 ${r.sequence}`;$('room-id').value=r.id;$('room-name').value=r.name;$('room-url').value=r.url;$('room-notes').value=r.notes||'';$('room-enabled').checked=!!r.enabled}
+async function saveRoom(){let body={name:$('room-name').value,url:$('room-url').value,enabled:$('room-enabled').checked,notes:$('room-notes').value};let id=$('room-id').value;let r=await fetch(id?`/api/rooms/${id}`:'/api/rooms',{method:id?'PATCH':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let d=await r.json();$('room-message').textContent=r.ok?'保存成功':errorText(d.detail);if(r.ok)setTimeout(()=>location.reload(),400)}
+async function toggleRoom(id,enabled){let r=await fetch(`/api/rooms/${id}/toggle`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});let d=await r.json();if(!r.ok)alert(d.detail||'操作失败');else location.reload()}
+async function archiveRoom(id){if(!confirm('归档不是删除：它会停止监控并从首页隐藏，但录像、转写和候选历史都会保留。确定归档吗？'))return;let r=await fetch(`/api/rooms/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({archived:true,enabled:false})});let d=await r.json();if(!r.ok)alert(errorText(d.detail));else location.reload()}
+async function deleteRoom(id){if(!confirm('确认删除这个误填的直播间？\n\n只有完全没有录像和候选历史的直播间才能删除；有历史记录时系统会阻止删除并提示使用归档。'))return;let r=await fetch(`/api/rooms/${id}`,{method:'DELETE'});let d=await r.json();if(!r.ok)alert(errorText(d.detail));else location.reload()}
+async function importRooms(input){const file=input.files&&input.files[0];if(!file)return;try{const data=JSON.parse(await file.text());const count=Array.isArray(data.rooms)?data.rooms.length:0;if(!confirm(`准备导入 ${count} 个直播间。相同序号、名称或链接会更新，不会导入录像、转写或素材记录。是否继续？`))return;const r=await fetch('/api/rooms/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const d=await r.json();if(!r.ok){alert(errorText(d.detail));return}alert(`导入完成：新增 ${d.created} 个，更新 ${d.updated} 个直播间。`);location.reload()}catch(e){alert(`导入失败：${e.message||e}`)}finally{input.value=''}}
+restoreRoomFilters()
+setInterval(()=>{if(document.visibilityState==='visible'&&$('room-form').classList.contains('hidden')&&$('room-batch-form').classList.contains('hidden'))location.reload()},30000)
+</script></body></html>

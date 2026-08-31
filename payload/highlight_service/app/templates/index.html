@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>直播高光审核台</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260813-4">
+  <link rel="stylesheet" href="/static/review-grid.css?v=20260813-1">
+  <link rel="stylesheet" href="/static/filter-enhancements.css?v=20260831-1">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>直播高光审核台</h1><p>三列快速审核 · 接受、暂存或拒绝候选素材</p></div>
+    <nav><a href="/">直播间</a><a href="/review">素材审核</a><a href="/export">成片导出</a></nav>
+  </header>
+  <main class="review-main">
+    <section class="health-grid review-health">
+      <div class="health {{ 'ok' if recorder_running else 'warn' }}"><b>直播录制器</b><span>{{ '自动值守运行中' if recorder_running else '等待自动启动' }}</span></div>
+      <div class="health {{ 'ok' if asr_available else 'warn' }}"><b>本地转写</b><span>{{ asr_runtime if asr_available else '未安装 Whisper' }}</span></div>
+      <div class="health {{ 'ok' if cloud_text else 'warn' }}"><b>GPT 语义剪辑</b><span>{{ 'gpt-5.5 已配置' if cloud_text else '等待配置 API Key' }}</span></div>
+      <div class="health {{ 'ok' if deepseek_supplement else 'warn' }}"><b>DeepSeek 补漏</b><span>{{ '自动补漏已启用' if deepseek_supplement else '未启用' }}</span></div>
+      <div class="health {{ 'ok' if cloud_vision else 'warn' }}"><b>商品一致性</b><span>{{ '线上视觉已启用' if cloud_vision else '本地关键帧（免费）' }}</span></div>
+      <div class="health"><b>录像目录</b><span title="{{ input_dir }}">{{ input_dir }}</span></div>
+    </section>
+
+    <section class="toolbar review-toolbar">
+      <div class="tabs">
+        {% for key,label in [('pending_review','待审核'),('deferred','暂存待用'),('accepted','已接受'),('rejected','已拒绝'),('render_error','渲染异常'),('superseded','旧算法结果'),('all','全部审核记录')] %}
+          <a class="{{ 'active' if selected_status == key else '' }}" href="/review?status={{ key }}{% if selected_room_id %}&room_id={{ selected_room_id }}{% endif %}{% if selected_model %}&model={{ selected_model }}{% endif %}{% if selected_output_date %}&output_date={{ selected_output_date }}{% endif %}">{{ label }}</a>
+        {% endfor %}
+      </div><button class="secondary" onclick="location.reload()">刷新状态</button>
+    </section>
+    <form id="review-filters" class="filter-bar smart-filter-bar review-filter-bar" method="get" action="/review"><input type="hidden" name="status" value="{{ selected_status }}">
+      <label class="select-filter">直播间<select name="room_id" onchange="applyFilters(this.form)"><option value="">全部直播间</option>{% for room in rooms %}<option value="{{ room.id }}" {{ 'selected' if selected_room_id==room.id else '' }}>{{ room.sequence }} · {{ room.name }}</option>{% endfor %}</select></label>
+      <label class="select-filter">模型<select name="model" onchange="applyFilters(this.form)"><option value="">全部模型</option><option value="gpt" {{ 'selected' if selected_model=='gpt' else '' }}>GPT-5.5 主选</option><option value="deepseek" {{ 'selected' if selected_model=='deepseek' else '' }}>DeepSeek 补漏</option></select></label>
+      <div class="date-filter"><label>产出日期（北京时间）<input id="review-output-date" type="date" name="output_date" value="{{ selected_output_date }}" onclick="openDatePicker(this)" onchange="applyFilters(this.form)"></label><div class="quick-dates"><button type="button" onclick="setQuickDate('review-output-date',0)">今天</button><button type="button" onclick="setQuickDate('review-output-date',-1)">昨天</button><button type="button" onclick="clearDate('review-output-date')">清除</button></div></div>
+      <div class="filter-actions"><button class="secondary" type="submit">应用筛选</button><button class="secondary" type="button" onclick="clearReviewFilters(this.form)">清除全部</button></div>
+    </form>
+    <p class="filter-tip">选择直播间、模型或日期后会立即筛选；点击日期输入框任意位置都能打开日历。</p>
+
+    {% if selected_status in ['pending_review','deferred','all'] %}
+    <section class="batch-bar">
+      <label class="select-all"><input type="checkbox" id="select-all" onchange="toggleAll(this.checked)"> 全选当前候选</label>
+      <strong id="selected-count">已选 0 条</strong>
+      <input id="batch-reason" placeholder="批量审核备注（可选）">
+      <button class="primary" onclick="batchAccept()">批量接受</button>
+      <button class="secondary" onclick="batchDisposition('defer')">暂存待用</button>
+      <button class="danger" onclick="batchDisposition('reject')">不需要</button>
+      <small>接受后，素材会自动进入独立的“成片导出”页面。</small>
+      <span id="batch-message" class="message"></span>
+    </section>
+    {% endif %}
+
+    <section class="candidate-list review-grid">
+    {% for candidate in candidates %}
+      <article class="candidate review-card" id="candidate-{{ candidate.id }}">
+        <div class="card-select-row">
+          {% if candidate.status in ['pending_review','deferred'] %}<label><input class="candidate-check" type="checkbox" value="{{ candidate.id }}" onchange="updateSelection()"> 选择</label>{% endif %}
+          <span>#{{ candidate.id }} · {{ candidate.duration }}秒</span>
+        </div>
+        <div class="video-panel">
+          {% if candidate.preview_path %}<video controls preload="metadata" src="/media?path={{ candidate.preview_path|urlencode }}&v={{ candidate.updated_at|urlencode }}"></video>
+          {% else %}<div class="video-placeholder">{{ candidate.status }}<br>预览尚未生成</div>{% endif %}
+          <div class="score-row"><span>卖点 {{ '%.0f'|format(candidate.sales_score*100) }}</span><span>完整 {{ '%.0f'|format(candidate.coherence_score*100) }}</span><span>商品 {{ '%.0f'|format(candidate.product_score*100) }}</span><span>综合 {{ '%.0f'|format(candidate.confidence*100) }}</span></div>
+        </div>
+        <div class="review-panel">
+          <div class="candidate-title"><b>{{ candidate.source_id }} · {{ candidate.model_role }}</b><span>{{ candidate.status }} · 产出 {{ candidate.created_at_local }}{% if candidate.exported_at_local %} · 导出 {{ candidate.exported_at_local }}{% endif %}</span></div>
+          <p class="reason clamp">{{ candidate.reason }}</p>
+          {% if candidate.compliance_hits %}<div class="risks">硬规则删除：{% for hit in candidate.compliance_hits %}<span>{{ hit }}</span>{% endfor %}</div>{% endif %}
+          {% if candidate.risks %}<div class="risks">复核风险：{% for risk in candidate.risks %}<span>{{ risk }}</span>{% endfor %}</div>{% endif %}
+          <details class="advanced-review"><summary>展开文案与区间编辑</summary>
+            <details><summary>查看保留/删除句子</summary><p><b>保留：</b>{% for c in candidate.kept_clauses %}<br>{{ c.id }} [{{ c.start }}–{{ c.end }}] {{ c.caption_text or c.text }}{% endfor %}</p><p><b>删除：</b>{% for c in candidate.removed_clauses %}<br>{{ c.id }} [{{ c.start }}–{{ c.end }}] {{ c.text }}{% endfor %}</p></details>
+            <label>保留区间<textarea id="ranges-{{ candidate.id }}" rows="3">{{ candidate.source_ranges_text }}</textarea></label>
+            <label>审核文案<textarea id="captions-{{ candidate.id }}" rows="5">{{ candidate.caption_text }}</textarea></label>
+          </details>
+          <label>审核备注<input id="reason-{{ candidate.id }}" placeholder="接受理由或拒绝原因"></label>
+          {% if candidate.status in ['pending_review','deferred'] %}<div class="actions"><button class="secondary" onclick="rerender({{ candidate.id }})">重新渲染</button><button class="secondary" onclick="review({{ candidate.id }},'defer')">暂存待用</button><button class="danger" onclick="review({{ candidate.id }},'reject')">不需要</button><button class="primary" onclick="review({{ candidate.id }},'accept')">接受</button></div>{% else %}<p class="message success">审核已完成{% if candidate.status == 'accepted' %}，已进入“成片导出”页面{% endif %}。</p>{% endif %}
+          <div class="message" id="message-{{ candidate.id }}"></div>
+        </div>
+      </article>
+    {% else %}<div class="empty"><h2>当前没有候选片段</h2><p>系统允许整场输出 0 条；只有适合短视频的产品讲解才会进入这里。</p></div>{% endfor %}
+    </section>
+  </main>
+  <script>
+    function applyFilters(form){const params=new URLSearchParams();for(const [key,value] of new FormData(form)){if(String(value).trim())params.append(key,String(value))}location.assign(`${form.action}${params.size?`?${params}`:''}`)}
+    function openDatePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch(error){}}}
+    function localDate(offset){const date=new Date();date.setDate(date.getDate()+offset);const y=date.getFullYear(),m=String(date.getMonth()+1).padStart(2,'0'),d=String(date.getDate()).padStart(2,'0');return `${y}-${m}-${d}`}
+    function setQuickDate(id,offset){const input=document.getElementById(id);input.value=localDate(offset);applyFilters(input.form)}
+    function clearDate(id){const input=document.getElementById(id);input.value='';applyFilters(input.form)}
+    function clearReviewFilters(form){form.querySelector('[name="room_id"]').value='';form.querySelector('[name="model"]').value='';form.querySelector('[name="output_date"]').value='';applyFilters(form)}
+    function cleanRanges(id){return JSON.parse(document.getElementById(`ranges-${id}`).value).map(item=>({start:Number(item.start),end:Number(item.end)}))}
+    function payload(id){const source_ranges=cleanRanges(id);return {start_time:source_ranges[0].start,end_time:source_ranges[source_ranges.length-1].end,source_ranges,caption_text:document.getElementById(`captions-${id}`).value}}
+    function errorText(detail){if(typeof detail==='string')return detail;if(Array.isArray(detail))return detail.map(item=>item.msg||item.message||JSON.stringify(item)).join('；');if(detail&&typeof detail==='object')return detail.msg||detail.message||JSON.stringify(detail);return '操作失败'}
+    async function call(id,url,body){const box=document.getElementById(`message-${id}`);box.textContent='处理中…';const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await res.json();if(!res.ok){box.textContent=errorText(data.detail);box.className='message error';throw new Error(box.textContent)}box.textContent='操作完成';box.className='message success';return data}
+    async function rerender(id){try{await call(id,`/api/candidates/${id}/render`,payload(id));location.reload()}catch(e){}}
+    async function review(id,action){try{const data={action,reason:document.getElementById(`reason-${id}`).value};await call(id,`/api/candidates/${id}/review`,data);document.getElementById(`candidate-${id}`).remove();updateSelection()}catch(e){}}
+    function selectedIds(){return [...document.querySelectorAll('.candidate-check:checked')].map(item=>Number(item.value))}
+    function updateSelection(){const ids=selectedIds();const count=document.getElementById('selected-count');if(count)count.textContent=`已选 ${ids.length} 条`;const all=document.getElementById('select-all');const boxes=[...document.querySelectorAll('.candidate-check')];if(all)all.checked=boxes.length>0&&ids.length===boxes.length}
+    function toggleAll(checked){document.querySelectorAll('.candidate-check').forEach(item=>item.checked=checked);updateSelection()}
+    async function batchAccept(){const ids=selectedIds(),box=document.getElementById('batch-message');if(!ids.length){box.textContent='请先勾选候选';box.className='message error';return}box.textContent=`正在接受 ${ids.length} 条…`;box.className='message';const res=await fetch('/api/review/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids,action:'accept',reason:document.getElementById('batch-reason').value})});const data=await res.json();if(!res.ok){box.textContent=errorText(data.detail);box.className='message error';return}ids.forEach(id=>document.getElementById(`candidate-${id}`)?.remove());box.textContent=`已接受 ${data.count} 条`;box.className='message success';updateSelection()}
+    async function batchDisposition(action){const ids=selectedIds(),box=document.getElementById('batch-message');if(!ids.length){box.textContent='请先勾选候选';box.className='message error';return}const label=action==='reject'?'不需要':'暂存待用';if(action==='reject'&&!confirm(`确认将选中的 ${ids.length} 条标记为“不需要”？这些素材不必打包，并可参与后续安全清理。`))return;box.textContent=`正在标记 ${ids.length} 条为${label}…`;box.className='message';const reason=document.getElementById('batch-reason').value||(action==='reject'?'人工确认不需要':'暂存待用');const res=await fetch('/api/review/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids,action,reason})});const data=await res.json();if(!res.ok){box.textContent=errorText(data.detail);box.className='message error';return}ids.forEach(id=>document.getElementById(`candidate-${id}`)?.remove());box.textContent=`已将 ${data.count} 条标记为${label}`;box.className='message success';updateSelection()}
+  </script>
+</body></html>
