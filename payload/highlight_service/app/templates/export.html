@@ -59,7 +59,7 @@
       <button id="batch-export-button" class="primary" type="button" onclick="batchExportZip()">批量生成并下载 ZIP</button>
       <span id="batch-export-message" class="message"></span>
     </section>
-    <p class="retention-copy">每条素材首次生成后永久保留“已导出”标记和时间；已生成的成片会直接复用。批量 ZIP 下载结束后自动清理临时压缩包，本机成片在 {{ retention_days }} 天后清理，记录仍保留。</p>
+    <p class="retention-copy">同一录像分片的候选全部导出或标记“不需要”后，原始录像、关键帧和过程缓存会立即自动安全清理；待审核、暂存或未导出的候选会阻止清理。最终成片保留 {{ retention_days }} 天，转写文字、模型结果、审核与导出记录永久保留；批量 ZIP 下载完成后自动清理临时压缩包。</p>
 
     <section class="candidate-list export-grid">
     {% for candidate in candidates %}

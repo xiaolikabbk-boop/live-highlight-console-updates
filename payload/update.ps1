@@ -1,11 +1,26 @@
 ﻿$ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$WebInstall = $args.Count -ge 1 -and [string]$args[0] -eq '-WebInstall'
+$ServicePid = if ($WebInstall -and $args.Count -ge 2 -and [string]$args[1] -match '^\d+$') { [int]$args[1] } else { 0 }
 $VersionFile = Join-Path $Root "VERSION"
 $ConfigFile = Join-Path $Root "update-config.json"
 $UpdateRoot = Join-Path $Root "_update"
 $BackupRoot = Join-Path $UpdateRoot "backups"
 $LogRoot = Join-Path $UpdateRoot "logs"
 $PidFile = Join-Path $Root "highlight_service\data\service.pid"
+$WebMarker = Join-Path $UpdateRoot "web-update-in-progress"
+$WebStatus = Join-Path $UpdateRoot "web-update-status.json"
+$ServiceStopped = $false
+$WorkDir = $null
+$BackupDir = $null
+$State = $null
+
+function Set-WebUpdateStatus([string]$Status, [string]$Message, [string]$Version = "") {
+    if (-not $WebInstall) { return }
+    New-Item -ItemType Directory -Path $UpdateRoot -Force | Out-Null
+    [ordered]@{ status=$Status; message=$Message; version=$Version; updated_at=(Get-Date).ToString('o') } |
+        ConvertTo-Json | Set-Content -LiteralPath $WebStatus -Encoding UTF8
+}
 
 function Convert-Version([string]$Value) {
     try { return [version]($Value.Trim().TrimStart('v','V')) }
@@ -67,8 +82,10 @@ Write-Host "当前版本：$CurrentText" -ForegroundColor Cyan
 if (Test-Path -LiteralPath $PidFile) {
     $PidText = (Get-Content -LiteralPath $PidFile -Raw).Trim()
     if ($PidText -match '^\d+$' -and (Get-Process -Id ([int]$PidText) -ErrorAction SilentlyContinue)) {
-        Write-Host "检测到中控台仍在运行。为避免打断转写或渲染，请先关闭黑色中控台窗口，再重新运行本更新程序。" -ForegroundColor Yellow
-        exit 2
+        if (-not $WebInstall -or [int]$PidText -ne $ServicePid) {
+            Write-Host "检测到中控台仍在运行。为避免打断转写或渲染，请先关闭黑色中控台窗口，再重新运行本更新程序。" -ForegroundColor Yellow
+            exit 2
+        }
     }
 }
 
@@ -80,11 +97,12 @@ $AvailableText = ([string]$Release.tag_name).TrimStart('v','V')
 Write-Host "可用版本：$AvailableText" -ForegroundColor Cyan
 if ((Convert-Version $AvailableText) -le (Convert-Version $CurrentText)) {
     Write-Host "当前已经是最新版本，无需更新。" -ForegroundColor Green
+    Set-WebUpdateStatus "current" "当前已经是最新版本" $CurrentText
     exit 0
 }
 $Asset = @($Release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
 if ($null -eq $Asset) { throw "最新版本没有找到更新包 $AssetName。" }
-$Answer = Read-Host "发现新版本。输入 YES 下载、备份并安装"
+$Answer = if ($WebInstall) { "YES" } else { Read-Host "发现新版本。输入 YES 下载、备份并安装" }
 if ($Answer -ne 'YES') { Write-Host "已取消更新。"; exit 0 }
 
 New-Item -ItemType Directory -Path $UpdateRoot,$BackupRoot,$LogRoot -Force | Out-Null
@@ -132,6 +150,13 @@ try {
         } else { $State.added_files += $Item.Relative }
     }
     $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $BackupDir 'update-state.json') -Encoding UTF8
+    if ($WebInstall -and $ServicePid -gt 0) {
+        New-Item -ItemType File -Path $WebMarker -Force | Out-Null
+        Set-WebUpdateStatus "installing" "更新包已校验，正在重启中控台" $AvailableText
+        Stop-Process -Id $ServicePid -Force -ErrorAction SilentlyContinue
+        $ServiceStopped = $true
+        Start-Sleep -Seconds 2
+    }
     foreach ($Item in $Validated) {
         $Target = Join-Path $Root $Item.Relative
         $TargetParent = Split-Path -Parent $Target
@@ -140,14 +165,24 @@ try {
     }
     Write-Host "更新完成：$CurrentText -> $AvailableText" -ForegroundColor Green
     Write-Host "直播间、密钥、数据库、录像、素材、模型和导出记录均未触碰。" -ForegroundColor Green
+    Set-WebUpdateStatus "complete" "更新完成，正在重新启动中控台" $AvailableText
 }
 catch {
     if ($null -ne $State -and (Test-Path -LiteralPath $BackupDir)) {
         Write-Host "安装失败，正在自动恢复更新前版本……" -ForegroundColor Yellow
         Restore-Backup $State $BackupDir
     }
+    Set-WebUpdateStatus "failed" $_.Exception.Message $CurrentText
+    if ($WebInstall -and $ServiceStopped) {
+        Remove-Item -LiteralPath $WebMarker -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath (Join-Path $Root '启动直播录制剪辑中控台.bat') -WorkingDirectory $Root
+    }
     throw
 }
 finally {
-    if (Test-Path -LiteralPath $WorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
+    if ($WorkDir -and (Test-Path -LiteralPath $WorkDir)) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
+}
+if ($WebInstall) {
+    Remove-Item -LiteralPath $WebMarker -Force -ErrorAction SilentlyContinue
+    Start-Process -FilePath (Join-Path $Root '启动直播录制剪辑中控台.bat') -WorkingDirectory $Root
 }

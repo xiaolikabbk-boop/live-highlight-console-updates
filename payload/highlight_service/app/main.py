@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from typing import Any, Literal
 from urllib.parse import quote, urlparse
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -45,6 +47,45 @@ def current_app_version() -> str:
         return "开发版"
 
 
+def _version_parts(value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in value.strip().lstrip("vV").split("."))
+    except ValueError:
+        return (0,)
+
+
+def github_update_status() -> dict[str, Any]:
+    root = settings.service_root.parent
+    config_path = root / "update-config.json"
+    if not config_path.is_file():
+        return {"ok": False, "current_version": current_app_version(), "message": "缺少更新配置文件"}
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        repository = str(config.get("repository") or "").strip()
+        if repository.count("/") != 1 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./" for char in repository):
+            raise ValueError("更新仓库地址无效")
+        response = httpx.get(
+            f"https://api.github.com/repos/{repository}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "Live-Highlight-Web-Updater"},
+            timeout=20,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        release = response.json()
+        available = str(release.get("tag_name") or "").strip().lstrip("vV")
+        current = current_app_version()
+        return {
+            "ok": True,
+            "current_version": current,
+            "available_version": available,
+            "update_available": _version_parts(available) > _version_parts(current),
+            "release_url": str(release.get("html_url") or ""),
+            "message": "发现新版本" if _version_parts(available) > _version_parts(current) else "当前已经是最新版本",
+        }
+    except (OSError, ValueError, json.JSONDecodeError, httpx.HTTPError) as exc:
+        return {"ok": False, "current_version": current_app_version(), "message": f"检查更新失败：{exc}"}
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     pid_file = settings.data_dir / "service.pid"
@@ -53,6 +94,7 @@ async def lifespan(_: FastAPI):
     async def retention_loop() -> None:
         while True:
             cleanup_expired_candidate_media()
+            cleanup_all_ready_segments()
             await asyncio.sleep(3600)
     retention_task = asyncio.create_task(retention_loop())
     try:
@@ -642,6 +684,66 @@ def handoff_segment_reports(job_ids: list[int]) -> list[dict[str, Any]]:
             seen.add(segment_id)
             reports.append(segment_cleanup_report(segment_id))
     return reports
+
+
+class WebUpdateRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.get("/api/update/status")
+def web_update_status() -> dict[str, Any]:
+    return github_update_status()
+
+
+@app.get("/api/update/current")
+def web_update_current() -> dict[str, str]:
+    return {"current_version": current_app_version()}
+
+
+@app.post("/api/update/install")
+def web_update_install(payload: WebUpdateRequest) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(422, "必须明确确认后才能安装更新")
+    active_tasks = db.all(
+        """SELECT id,status FROM recording_segments
+           WHERE status IN ('transcribing','gpt_analyzing','deepseek_analyzing')
+           UNION ALL
+           SELECT id,status FROM highlight_candidates WHERE status='rendering'"""
+    )
+    active_rooms = db.all(
+        "SELECT sequence,name FROM live_rooms WHERE archived=0 AND enabled=1 AND live_status='live' ORDER BY sequence"
+    )
+    blockers: list[str] = []
+    if active_tasks:
+        blockers.append(f"还有 {len(active_tasks)} 个转写、模型或渲染任务正在运行")
+    if active_rooms:
+        names = "、".join(f"{row['sequence']} {row['name']}" for row in active_rooms[:3])
+        blockers.append(f"仍有直播间开启录制：{names}" + ("等" if len(active_rooms) > 3 else ""))
+    if blockers:
+        raise HTTPException(409, {"message": "当前不适合更新，请先暂停录制并等待正在处理的任务完成", "blockers": blockers})
+    status = github_update_status()
+    if not status.get("ok"):
+        raise HTTPException(503, status.get("message") or "暂时无法检查更新")
+    if not status.get("update_available"):
+        return {"ok": True, "started": False, **status}
+    root = settings.service_root.parent
+    update_script = root / "update.ps1"
+    if not update_script.is_file():
+        raise HTTPException(409, "程序目录缺少 update.ps1，请先使用完整包或一次性更新补丁")
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    subprocess.Popen(
+        ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+         str(update_script), "-WebInstall", str(os.getpid())],
+        cwd=str(root),
+        creationflags=creationflags,
+    )
+    return {
+        "ok": True,
+        "started": True,
+        "current_version": status["current_version"],
+        "available_version": status["available_version"],
+        "message": "安全更新程序已启动；完成后中控台会自动重启",
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1281,6 +1383,55 @@ def cleanup_segment(segment_id: int, payload: SegmentCleanupRequest) -> dict[str
             "released_gb": round(released / (1024 ** 3), 3), "candidate_ids": candidate_ids}
 
 
+def cleanup_ready_segments(segment_ids: list[int]) -> dict[str, Any]:
+    """Safely remove source media only after every related candidate has a final disposition."""
+    cleaned: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for segment_id in list(dict.fromkeys(segment_ids)):
+        report = segment_cleanup_report(segment_id)
+        if report["already_cleaned"]:
+            continue
+        if not report["cleanable"]:
+            blocked.append({"segment_id": segment_id, "blockers": report["blockers"]})
+            continue
+        cleaned.append(cleanup_segment(segment_id, SegmentCleanupRequest(confirm=True)))
+    released = sum(int(item["released_bytes"]) for item in cleaned)
+    if cleaned:
+        db.event("info", "automatic_segment_cleanup", f"已自动安全清理 {len(cleaned)} 个完成分片", {
+            "segment_ids": [item["segment_id"] for item in cleaned],
+            "released_bytes": released,
+            "rule": "all_candidates_exported_or_rejected",
+        })
+    return {
+        "cleaned_count": len(cleaned),
+        "cleaned_segment_ids": [item["segment_id"] for item in cleaned],
+        "released_bytes": released,
+        "released_gb": round(released / (1024 ** 3), 3),
+        "blocked": blocked,
+    }
+
+
+def cleanup_ready_segments_for_candidate(candidate_id: int) -> dict[str, Any]:
+    candidate = db.one("SELECT * FROM highlight_candidates WHERE id=?", (candidate_id,))
+    if not candidate:
+        return {"cleaned_count": 0, "cleaned_segment_ids": [], "released_bytes": 0, "released_gb": 0, "blocked": []}
+    segments = [
+        segment for segment in db.all(
+            "SELECT * FROM recording_segments WHERE session_id=? AND status IN ('complete','analyzed') ORDER BY id",
+            (candidate["session_id"],),
+        ) if _candidate_overlaps_segment(candidate, segment)
+    ]
+    return cleanup_ready_segments([int(segment["id"]) for segment in segments])
+
+
+def cleanup_all_ready_segments(limit: int = 100) -> dict[str, Any]:
+    rows = db.all(
+        "SELECT id FROM recording_segments WHERE status IN ('complete','analyzed') ORDER BY id LIMIT ?",
+        (max(1, min(limit, 1000)),),
+    )
+    return cleanup_ready_segments([int(row["id"]) for row in rows])
+
+
 @app.get("/api/review")
 def api_review(room_id: str = "", status: str = "pending_review", model: str = "",
                output_date: str = "", export_date: str = "") -> dict[str, Any]:
@@ -1422,7 +1573,8 @@ def review_candidate(candidate_id: int, payload: ReviewRequest) -> dict[str, Any
     if (candidate["status"] in idempotent_statuses[payload.action]
             and start == candidate["start_time"] and end == candidate["end_time"]
             and captions == candidate["captions"]):
-        return {"ok": True, "candidate": candidate, "idempotent": True}
+        auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id) if payload.action == "reject" else None
+        return {"ok": True, "candidate": candidate, "idempotent": True, "auto_cleanup": auto_cleanup}
     status = candidate["status"] if payload.action == "accept" and candidate["status"] == "exported" else desired_status
     version = int(candidate["version"]) + int(start != candidate["start_time"] or end != candidate["end_time"] or captions != candidate["captions"])
     db.execute(
@@ -1441,7 +1593,8 @@ def review_candidate(candidate_id: int, payload: ReviewRequest) -> dict[str, Any
         "UPDATE publish_jobs SET status='cancelled',updated_at=? WHERE candidate_id=? AND status NOT IN ('exported','published')",
         (utc_now(), candidate_id),
     )
-    return {"ok": True, "candidate": updated}
+    auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id) if payload.action == "reject" else None
+    return {"ok": True, "candidate": updated, "auto_cleanup": auto_cleanup}
 
 
 @app.post("/api/review/batch")
@@ -1470,8 +1623,10 @@ def export_candidate(candidate_id: int) -> dict[str, Any]:
     if candidate["status"] == "exported" and candidate.get("output_path") and Path(candidate["output_path"]).exists():
         destination = Path(candidate["output_path"])
         metadata_path = str(destination.with_suffix(".json"))
+        auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id)
         return {"ok": True, "output_path": candidate["output_path"], "metadata_path": metadata_path,
-                "exported_at": candidate.get("exported_at") or "", "idempotent": True}
+                "exported_at": candidate.get("exported_at") or "", "idempotent": True,
+                "auto_cleanup": auto_cleanup}
     stem = f"{safe_id(candidate['source_id'])}_{safe_id(candidate['session_id'])}_{candidate_id}"
     destination = settings.output_dir / "approved" / f"{stem}.mp4"
     preview_path = Path(candidate.get("preview_path") or "")
@@ -1520,8 +1675,9 @@ def export_candidate(candidate_id: int) -> dict[str, Any]:
            media_cleaned_at='',media_released_bytes=0,updated_at=? WHERE id=?""",
         (str(destination), exported_at, exported_at, candidate_id),
     )
+    auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id)
     return {"ok": True, "output_path": str(destination), "metadata_path": str(metadata_path),
-            "exported_at": exported_at, "idempotent": False}
+            "exported_at": exported_at, "idempotent": False, "auto_cleanup": auto_cleanup}
 
 
 @app.post("/api/candidates/batch-export")

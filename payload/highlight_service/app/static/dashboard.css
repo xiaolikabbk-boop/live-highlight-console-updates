@@ -28,6 +28,12 @@ main > .summary-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .room-dialog .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 14px; }
 .control-strip button { margin-left: 0; }
 .control-strip .batch-room-open { margin-left: auto; }
+.update-strip { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: -7px 0 18px; padding: 12px 14px; background: #f7faff; border: 1px solid #cdddf3; border-radius: 10px; }
+.update-strip > div:first-child { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.update-strip span { color: #667085; font-size: 12px; }
+.update-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.update-actions #update-message { max-width: 520px; color: #28517e; text-align: right; }
+.update-actions button { white-space: nowrap; }
 .batch-room-dialog { width: min(1080px, calc(100vw - 32px)); }
 .batch-room-help { margin: -6px 0 12px; color: var(--muted); font-size: 13px; }
 .batch-room-enabled { display: flex; align-items: center; gap: 7px; margin: 10px 0; font-size: 13px; }

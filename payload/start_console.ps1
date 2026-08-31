@@ -51,6 +51,11 @@ try {
     )
     Write-Host "Starting the console at http://127.0.0.1:8876 ..." -ForegroundColor Green
     & $PythonExe -m app.main
+    $WebUpdateMarker = Join-Path $Root "_update\web-update-in-progress"
+    if (Test-Path -LiteralPath $WebUpdateMarker) {
+        Write-Host "Web update is restarting the console..." -ForegroundColor Cyan
+        exit 0
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "The application exited with code $LASTEXITCODE."
     }
