@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -170,6 +170,29 @@ def optional_query_int(value: str | int | None, label: str) -> int | None:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, f"{label}筛选值无效") from exc
+
+
+def candidate_local_date(candidate: dict[str, Any], compact: bool = False) -> str:
+    """Return a candidate's output day in Beijing time for user-facing names."""
+    try:
+        created = datetime.fromisoformat(str(candidate.get("created_at") or "").replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        pattern = "%Y%m%d" if compact else "%Y-%m-%d"
+        return created.astimezone(timezone(timedelta(hours=8))).strftime(pattern)
+    except ValueError:
+        return datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d" if compact else "%Y-%m-%d")
+
+
+def candidate_room_file_prefix(candidate: dict[str, Any]) -> str:
+    raw_sequence = str(candidate.get("room_sequence") or "").strip()
+    sequence = safe_id(raw_sequence) if raw_sequence else ""
+    room_name = safe_id(str(candidate.get("room_name") or candidate.get("source_id") or "未知直播间"))
+    return f"{sequence}_{room_name}" if sequence else room_name
+
+
+def candidate_download_filename(candidate: dict[str, Any]) -> str:
+    return f"{candidate_room_file_prefix(candidate)}_{candidate_local_date(candidate, True)}_素材{int(candidate['id']):04d}.mp4"
 
 
 def active_recording_state(room: dict[str, Any]) -> dict[str, Any]:
@@ -703,73 +726,95 @@ def dashboard(request: Request, status: str = "pending_review", room_id: str = "
 
 
 @app.get("/export", response_class=HTMLResponse)
-def export_center(request: Request, status: str = "accepted", room_id: str = "",
-                  model: str = "", output_date: str = "", export_date: str = "") -> HTMLResponse:
+def export_center(request: Request, status: str = "accepted", room_id: str = "", source_id: str = "",
+                  model: str = "", output_date: str = "", export_date: str = "",
+                  date_scope: str = "") -> HTMLResponse:
     cleanup_expired_candidate_media()
     selected_room_id = optional_query_int(room_id, "直播间")
+    selected_source_id = source_id.strip()
     if status not in {"accepted", "exported", "all"}:
         status = "accepted"
-    conditions = ["status IN ('accepted','exported')"] if status == "all" else ["status=?"]
+    china_tz = timezone(timedelta(hours=8))
+    today_label = datetime.now(china_tz).strftime("%Y-%m-%d")
+    selected_date_scope = "all" if date_scope == "all" else "day"
+    effective_output_date = "" if selected_date_scope == "all" else (output_date.strip() or today_label)
+    conditions = ["h.status IN ('accepted','exported')"] if status == "all" else ["h.status=?"]
     params: list[Any] = [] if status == "all" else [status]
     if selected_room_id is not None:
-        conditions.append("room_id=?")
+        conditions.append("h.room_id=?")
         params.append(selected_room_id)
+    elif selected_source_id:
+        conditions.append("h.room_id IS NULL AND h.source_id=?")
+        params.append(selected_source_id)
     if model == "gpt":
-        conditions.append("analysis_version NOT LIKE '%deepseek%'")
+        conditions.append("h.analysis_version NOT LIKE '%deepseek%'")
     elif model == "deepseek":
-        conditions.append("analysis_version LIKE '%deepseek%'")
-    output_range = candidate_output_date_range(output_date)
+        conditions.append("h.analysis_version LIKE '%deepseek%'")
+    output_range = candidate_output_date_range(effective_output_date)
     if output_range:
-        conditions.append("created_at>=? AND created_at<?")
+        conditions.append("h.created_at>=? AND h.created_at<?")
         params.extend(output_range)
     exported_range = candidate_output_date_range(export_date)
     if exported_range:
-        conditions.append("exported_at>=? AND exported_at<?")
+        conditions.append("h.exported_at>=? AND h.exported_at<?")
         params.extend(exported_range)
     rows = db.all(
-        "SELECT * FROM highlight_candidates WHERE " + " AND ".join(conditions)
-        + " ORDER BY CASE WHEN exported_at='' THEN created_at ELSE exported_at END DESC LIMIT 500",
+        "SELECT h.*,r.sequence AS room_sequence,r.name AS room_name FROM highlight_candidates h "
+        "LEFT JOIN live_rooms r ON r.id=h.room_id WHERE " + " AND ".join(conditions)
+        + " ORDER BY CASE WHEN h.exported_at='' THEN h.created_at ELSE h.exported_at END DESC LIMIT 500",
         params,
     )
-    counts = db.one(
-        """SELECT SUM(status='accepted') AS waiting_export,
-                  SUM(status='exported') AS exported
-           FROM highlight_candidates"""
-    ) or {}
-    china_tz = timezone(timedelta(hours=8))
-    today_label = datetime.now(china_tz).strftime("%Y-%m-%d")
-    today_start, today_end = candidate_output_date_range(today_label) or ("", "")
-    today_room_stats = db.all(
+    card_conditions = ["h.status IN ('accepted','exported')"]
+    card_params: list[Any] = []
+    if output_range:
+        card_conditions.append("h.created_at>=? AND h.created_at<?")
+        card_params.extend(output_range)
+    if model == "gpt":
+        card_conditions.append("h.analysis_version NOT LIKE '%deepseek%'")
+    elif model == "deepseek":
+        card_conditions.append("h.analysis_version LIKE '%deepseek%'")
+    room_export_cards = db.all(
         """SELECT h.room_id,h.source_id,r.sequence,r.name AS room_name,
                   COUNT(*) AS produced,
                   SUM(h.status='exported') AS exported,
-                  SUM(h.status<>'exported') AS not_exported
+                  SUM(h.status='accepted') AS not_exported
            FROM highlight_candidates h
            LEFT JOIN live_rooms r ON r.id=h.room_id
-           WHERE h.created_at>=? AND h.created_at<?
-             AND h.status NOT IN ('visual_review','rendering','superseded')
+           WHERE """ + " AND ".join(card_conditions) + """
            GROUP BY CASE WHEN h.room_id IS NOT NULL THEN 'room:' || h.room_id ELSE 'source:' || h.source_id END
-           ORDER BY produced DESC,COALESCE(r.sequence,'999999'),h.source_id""",
-        (today_start, today_end),
+           ORDER BY COALESCE(r.sequence,'999999'),r.name,h.source_id""",
+        card_params,
     )
-    today_totals = {
-        "produced": sum(int(row["produced"] or 0) for row in today_room_stats),
-        "exported": sum(int(row["exported"] or 0) for row in today_room_stats),
-        "not_exported": sum(int(row["not_exported"] or 0) for row in today_room_stats),
+    date_totals = {
+        "produced": sum(int(row["produced"] or 0) for row in room_export_cards),
+        "exported": sum(int(row["exported"] or 0) for row in room_export_cards),
+        "not_exported": sum(int(row["not_exported"] or 0) for row in room_export_cards),
     }
+    selected_room_label = ""
+    if selected_room_id is not None:
+        selected = next((row for row in room_export_cards if row.get("room_id") == selected_room_id), None)
+        if selected:
+            selected_room_label = f"{selected.get('sequence') or ''} · {selected.get('room_name') or selected.get('source_id') or '未知直播间'}".strip(" ·")
+    elif selected_source_id:
+        selected_room_label = selected_source_id
     return templates.TemplateResponse(request, "export.html", {
         "candidates": [candidate_view(row) for row in rows],
         "selected_status": status,
         "selected_room_id": selected_room_id,
+        "selected_source_id": selected_source_id,
+        "selected_room_label": selected_room_label,
         "selected_model": model,
-        "selected_output_date": output_date,
+        "selected_output_date": effective_output_date,
         "selected_export_date": export_date,
+        "selected_date_scope": selected_date_scope,
         "rooms": db.all("SELECT id,sequence,name FROM live_rooms WHERE archived=0 ORDER BY sequence"),
-        "waiting_export": int(counts.get("waiting_export") or 0),
-        "exported_count": int(counts.get("exported") or 0),
+        "waiting_export": date_totals["not_exported"],
+        "exported_count": date_totals["exported"],
         "today_label": today_label,
-        "today_room_stats": today_room_stats,
-        "today_totals": today_totals,
+        "date_label": effective_output_date or "全部日期",
+        "room_export_cards": room_export_cards,
+        "date_totals": date_totals,
+        "show_materials": selected_room_id is not None or bool(selected_source_id),
         "retention_days": settings.candidate_media_retention_days,
     })
 
@@ -1504,7 +1549,6 @@ def batch_export_candidates(payload: BatchExportRequest) -> dict[str, Any]:
                 stale_archive.unlink()
         except OSError:
             pass
-    stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
     token = uuid4().hex
     archive_path = batch_dir / f"{token}.zip"
     manifest = {
@@ -1513,14 +1557,21 @@ def batch_export_candidates(payload: BatchExportRequest) -> dict[str, Any]:
         "candidate_ids": candidate_ids,
         "items": [],
     }
+    room_prefixes = {candidate_room_file_prefix(candidate) for candidate, _ in exported_files}
+    output_days = {candidate_local_date(candidate, True) for candidate, _ in exported_files}
+    package_room = next(iter(room_prefixes)) if len(room_prefixes) == 1 else "多个直播间"
+    package_day = next(iter(output_days)) if len(output_days) == 1 else "多日期"
+    download_name = f"{package_room}_{package_day}_{len(exported_files)}条素材.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for candidate, output_path in exported_files:
-            room_name = safe_id(candidate.get("source_id") or "直播间")
-            archive_name = f"候选{int(candidate['id']):04d}_{room_name}.mp4"
+            room_prefix = candidate_room_file_prefix(candidate)
+            archive_name = candidate_download_filename(candidate)
+            if len(room_prefixes) > 1:
+                archive_name = f"{room_prefix}/{archive_name}"
             archive.write(output_path, archive_name)
             manifest["items"].append({
                 "candidate_id": candidate["id"],
-                "room": candidate.get("source_id") or "",
+                "room": candidate.get("room_name") or candidate.get("source_id") or "",
                 "output_date": candidate.get("created_at") or "",
                 "exported_at": candidate.get("exported_at") or "",
                 "filename": archive_name,
@@ -1529,23 +1580,25 @@ def batch_export_candidates(payload: BatchExportRequest) -> dict[str, Any]:
     return {
         "ok": True,
         "count": len(exported_files),
-        "filename": f"直播成片_{stamp}_{len(exported_files)}条.zip",
-        "download_url": f"/api/batch-exports/{token}?count={len(exported_files)}",
+        "filename": download_name,
+        "download_url": f"/api/batch-exports/{token}?count={len(exported_files)}&filename={quote(download_name)}",
     }
 
 
 @app.get("/api/batch-exports/{token}")
-def download_batch_export(token: str, count: int = 0) -> FileResponse:
+def download_batch_export(token: str, count: int = 0, filename: str = "") -> FileResponse:
     if len(token) != 32 or any(char not in "0123456789abcdef" for char in token.lower()):
         raise HTTPException(404, "批量导出文件不存在")
     archive_path = settings.cache_dir / "batch_exports" / f"{token.lower()}.zip"
     if not archive_path.is_file():
         raise HTTPException(404, "批量导出文件不存在或已完成清理")
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
+    requested_stem = safe_id(Path(filename).stem) if filename else ""
+    download_name = f"{requested_stem}.zip" if requested_stem else f"直播成片_{stamp}_{max(1, count)}条.zip"
     return FileResponse(
         archive_path,
         media_type="application/zip",
-        filename=f"直播成片_{stamp}_{max(1, count)}条.zip",
+        filename=download_name,
         background=BackgroundTask(archive_path.unlink, missing_ok=True),
     )
 
@@ -1556,7 +1609,7 @@ def download_candidate(candidate_id: int) -> FileResponse:
     if candidate["status"] != "exported" or not candidate.get("output_path"):
         raise HTTPException(409, "该成片尚未导出，或本机文件已按保留期清理")
     path = allowed_media(candidate["output_path"])
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+    return FileResponse(path, media_type="video/mp4", filename=candidate_download_filename(candidate))
 
 
 @app.get("/publish", response_class=HTMLResponse)

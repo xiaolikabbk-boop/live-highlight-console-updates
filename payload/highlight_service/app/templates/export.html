@@ -6,7 +6,7 @@
   <link rel="stylesheet" href="/static/app.css?v=20260830-2">
   <link rel="stylesheet" href="/static/review-grid.css?v=20260813-1">
   <link rel="stylesheet" href="/static/filter-enhancements.css?v=20260831-1">
-  <link rel="stylesheet" href="/static/export-center.css?v=20260831-2">
+  <link rel="stylesheet" href="/static/export-center.css?v=20260831-3">
 </head>
 <body>
   <header class="topbar">
@@ -19,16 +19,10 @@
       <div class="summary"><b>{{ exported_count }}</b><span>已导出记录</span></div>
     </section>
 
-    <section class="today-output-overview">
-      <div class="today-output-head"><div><h2>今日产出概览</h2><p>{{ today_label }} · 北京时间</p></div><div class="today-output-totals"><span><b>{{ today_totals.produced }}</b> 今日产出</span><span><b>{{ today_totals.exported }}</b> 已导出</span><span><b>{{ today_totals.not_exported }}</b> 未导出</span></div></div>
-      {% if today_room_stats %}<div class="today-output-table"><table><thead><tr><th>直播间</th><th>今日产出</th><th>已导出</th><th>未导出</th></tr></thead><tbody>{% for row in today_room_stats %}<tr><td>{% if row.sequence %}<span class="today-room-seq">{{ row.sequence }}</span>{% endif %}<b>{{ row.room_name or row.source_id or '未知直播间' }}</b></td><td>{{ row.produced }}</td><td class="today-exported">{{ row.exported }}</td><td class="today-pending">{{ row.not_exported }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="today-output-empty">今天暂时还没有完成产出的候选素材。</p>{% endif %}
-      <p class="today-output-note">“未导出”表示今天产出但尚未形成导出记录的素材，包括仍待审核、暂存或不需要的素材。</p>
-    </section>
-
     <section class="toolbar review-toolbar">
       <div class="tabs">
         {% for key,label in [('accepted','待导出'),('exported','已导出'),('all','全部导出流程')] %}
-          <a class="{{ 'active' if selected_status == key else '' }}" href="/export?status={{ key }}{% if selected_room_id %}&room_id={{ selected_room_id }}{% endif %}{% if selected_model %}&model={{ selected_model }}{% endif %}{% if selected_output_date %}&output_date={{ selected_output_date }}{% endif %}{% if selected_export_date %}&export_date={{ selected_export_date }}{% endif %}">{{ label }}</a>
+          <a class="{{ 'active' if selected_status == key else '' }}" href="/export?status={{ key }}{% if selected_room_id %}&room_id={{ selected_room_id }}{% elif selected_source_id %}&source_id={{ selected_source_id|urlencode }}{% endif %}{% if selected_model %}&model={{ selected_model }}{% endif %}{% if selected_output_date %}&output_date={{ selected_output_date }}{% endif %}{% if selected_export_date %}&export_date={{ selected_export_date }}{% endif %}&date_scope={{ selected_date_scope }}">{{ label }}</a>
         {% endfor %}
       </div>
       <button class="secondary" onclick="location.reload()">刷新状态</button>
@@ -36,15 +30,29 @@
 
     <section class="export-filter-panel"><h2>筛选素材</h2><form id="export-filters" class="filter-bar smart-filter-bar" method="get" action="/export">
       <input type="hidden" name="status" value="{{ selected_status }}">
+      <input id="export-date-scope" type="hidden" name="date_scope" value="{{ selected_date_scope }}">
       <label class="select-filter">直播间<select name="room_id" onchange="applyFilters(this.form)"><option value="">全部直播间</option>{% for room in rooms %}<option value="{{ room.id }}" {{ 'selected' if selected_room_id==room.id else '' }}>{{ room.sequence }} · {{ room.name }}</option>{% endfor %}</select></label>
       <label class="select-filter">模型<select name="model" onchange="applyFilters(this.form)"><option value="">全部模型</option><option value="gpt" {{ 'selected' if selected_model=='gpt' else '' }}>GPT-5.5 主选</option><option value="deepseek" {{ 'selected' if selected_model=='deepseek' else '' }}>DeepSeek 补漏</option></select></label>
-      <div class="date-filter"><label>产出日期（北京时间）<input id="export-output-date" type="date" name="output_date" value="{{ selected_output_date }}" onclick="openDatePicker(this)" onchange="applyFilters(this.form)"></label><div class="quick-dates"><button type="button" onclick="setQuickDate('export-output-date',0)">今天</button><button type="button" onclick="setQuickDate('export-output-date',-1)">昨天</button><button type="button" onclick="clearDate('export-output-date')">清除</button></div></div>
+      <div class="date-filter"><label>产出日期（北京时间）<input id="export-output-date" type="date" name="output_date" value="{{ selected_output_date }}" onclick="openDatePicker(this)" onchange="document.getElementById('export-date-scope').value='day';applyFilters(this.form)"></label><div class="quick-dates"><button type="button" onclick="setQuickDate('export-output-date',0)">今天</button><button type="button" onclick="setQuickDate('export-output-date',-1)">昨天</button><button type="button" onclick="clearDate('export-output-date')">全部日期</button></div></div>
       <div class="date-filter"><label>导出日期（北京时间）<input id="export-export-date" type="date" name="export_date" value="{{ selected_export_date }}" onclick="openDatePicker(this)" onchange="applyFilters(this.form)"></label><div class="quick-dates"><button type="button" onclick="setQuickDate('export-export-date',0)">今天</button><button type="button" onclick="setQuickDate('export-export-date',-1)">昨天</button><button type="button" onclick="clearDate('export-export-date')">清除</button></div></div>
       <div class="filter-actions"><button class="secondary" type="submit">应用筛选</button><button class="secondary" type="button" onclick="clearAllFilters(this.form)">清除全部</button></div>
     </form>
-    <p class="filter-tip">选择直播间、模型或日期后会立即筛选；点击日期输入框任意位置都能打开日历。</p>
+    <p class="filter-tip">默认展示今天；选择日期后查看当天直播间，点击直播间卡片再进入素材列表。</p>
     </section>
 
+    <section class="today-output-overview">
+      <div class="today-output-head"><div><h2>{{ date_label }} 直播间产出</h2><p>先选直播间，再集中预览和下载该直播间素材</p></div><div class="today-output-totals"><span><b>{{ date_totals.produced }}</b> 可导出素材</span><span><b>{{ date_totals.exported }}</b> 已导出</span><span><b>{{ date_totals.not_exported }}</b> 待导出</span></div></div>
+      {% if room_export_cards %}<div class="export-room-grid">{% for row in room_export_cards %}
+        <a class="export-room-card {{ 'selected' if (selected_room_id and selected_room_id==row.room_id) or (selected_source_id and selected_source_id==row.source_id and not row.room_id) else '' }}" href="/export?status=all{% if row.room_id %}&room_id={{ row.room_id }}{% else %}&source_id={{ row.source_id|urlencode }}{% endif %}{% if selected_model %}&model={{ selected_model }}{% endif %}{% if selected_output_date %}&output_date={{ selected_output_date }}{% endif %}&date_scope={{ selected_date_scope }}">
+          <div class="export-room-name">{% if row.sequence %}<span>{{ row.sequence }}</span>{% endif %}<b>{{ row.room_name or row.source_id or '未知直播间' }}</b></div>
+          <div class="export-room-count"><strong>{{ row.produced }}</strong><small>条素材</small></div>
+          <div class="export-room-stats"><span>待导出 <b>{{ row.not_exported }}</b></span><span>已导出 <b>{{ row.exported }}</b></span></div>
+          <em>点击查看全部素材 →</em>
+        </a>{% endfor %}</div>{% else %}<p class="today-output-empty">{{ date_label }} 暂时没有已审核接受的可导出素材。</p>{% endif %}
+    </section>
+
+    {% if show_materials %}
+    <div class="selected-room-heading"><div><span>当前直播间</span><h2>{{ selected_room_label or '直播间素材' }}</h2><p>{{ date_label }} · 待导出和已导出素材</p></div><a class="button secondary" href="/export?status=all{% if selected_model %}&model={{ selected_model }}{% endif %}{% if selected_output_date %}&output_date={{ selected_output_date }}{% endif %}&date_scope={{ selected_date_scope }}">← 返回全部直播间</a></div>
     <section class="export-batch-bar">
       <label class="select-all"><input id="select-all-export" type="checkbox" onchange="toggleAllExports(this.checked)"> 全选当前结果</label>
       <strong id="export-selected-count">已选 0 条</strong>
@@ -64,7 +72,7 @@
           <div class="score-row"><span>卖点 {{ '%.0f'|format(candidate.sales_score*100) }}</span><span>完整 {{ '%.0f'|format(candidate.coherence_score*100) }}</span><span>商品 {{ '%.0f'|format(candidate.product_score*100) }}</span><span>综合 {{ '%.0f'|format(candidate.confidence*100) }}</span></div>
         </div>
         <div class="review-panel export-info">
-          <div class="candidate-title"><b>{{ candidate.source_id }} · {{ candidate.model_role }}</b><span>产出 {{ candidate.created_at_local }}</span></div>
+          <div class="candidate-title"><b>{{ candidate.room_name or candidate.source_id }} · {{ candidate.model_role }}</b><span>产出 {{ candidate.created_at_local }}</span></div>
           <p class="reason export-reason">{{ candidate.reason }}</p>
           {% if candidate.status == 'exported' %}<p class="export-status done">✓ 已导出{% if candidate.exported_at_local %} · {{ candidate.exported_at_local }}{% endif %}{% if candidate.media_cleaned_at %} · 本机文件已自动清理{% endif %}</p>{% else %}<p class="export-status waiting">待导出 · 已审核接受</p>{% endif %}
           <div class="actions">
@@ -78,20 +86,23 @@
       </article>
     {% else %}<div class="empty"><h2>当前没有符合条件的成片</h2><p>审核页点击“接受”后，素材会自动进入这里；也可以清空日期或直播间筛选后再查看。</p></div>{% endfor %}
     </section>
+    {% else %}
+    <section class="room-first-empty"><h2>请选择一个直播间</h2><p>点击上方直播间卡片，即可查看和批量下载这个直播间在 {{ date_label }} 产出的全部素材。</p></section>
+    {% endif %}
   </main>
   <script>
     function applyFilters(form){const params=new URLSearchParams();for(const [key,value] of new FormData(form)){if(String(value).trim())params.append(key,String(value))}location.assign(`${form.action}${params.size?`?${params}`:''}`)}
     function openDatePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch(error){}}}
     function localDate(offset){const date=new Date();date.setDate(date.getDate()+offset);const y=date.getFullYear(),m=String(date.getMonth()+1).padStart(2,'0'),d=String(date.getDate()).padStart(2,'0');return `${y}-${m}-${d}`}
-    function setQuickDate(id,offset){const input=document.getElementById(id);input.value=localDate(offset);applyFilters(input.form)}
-    function clearDate(id){const input=document.getElementById(id);input.value='';applyFilters(input.form)}
-    function clearAllFilters(form){form.querySelector('[name="room_id"]').value='';form.querySelector('[name="model"]').value='';form.querySelector('[name="output_date"]').value='';form.querySelector('[name="export_date"]').value='';applyFilters(form)}
+    function setQuickDate(id,offset){const input=document.getElementById(id);input.value=localDate(offset);if(id==='export-output-date')document.getElementById('export-date-scope').value='day';applyFilters(input.form)}
+    function clearDate(id){const input=document.getElementById(id);input.value='';if(id==='export-output-date')document.getElementById('export-date-scope').value='all';applyFilters(input.form)}
+    function clearAllFilters(form){form.querySelector('[name="room_id"]').value='';form.querySelector('[name="model"]').value='';form.querySelector('[name="output_date"]').value=localDate(0);form.querySelector('[name="export_date"]').value='';form.querySelector('[name="date_scope"]').value='day';applyFilters(form)}
     function errorText(detail){if(typeof detail==='string')return detail;if(Array.isArray(detail))return detail.map(item=>item.msg||item.message||JSON.stringify(item)).join('；');if(detail&&typeof detail==='object')return detail.msg||detail.message||JSON.stringify(detail);return '操作失败'}
-    async function generateClip(id){const box=document.getElementById(`message-${id}`);box.textContent='正在生成成片，请稍候…';box.className='message';try{const res=await fetch(`/api/candidates/${id}/export`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const data=await res.json();if(!res.ok)throw new Error(errorText(data.detail));box.textContent=`已生成并记录导出：${data.output_path}`;box.className='message success';setTimeout(()=>{location.href=`/export?status=exported#candidate-${id}`},700)}catch(error){box.textContent=error.message;box.className='message error'}}
+    async function generateClip(id){const box=document.getElementById(`message-${id}`);box.textContent='正在生成成片，请稍候…';box.className='message';try{const res=await fetch(`/api/candidates/${id}/export`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const data=await res.json();if(!res.ok)throw new Error(errorText(data.detail));box.textContent=`已生成并记录导出：${data.output_path}`;box.className='message success';setTimeout(()=>location.reload(),700)}catch(error){box.textContent=error.message;box.className='message error'}}
     function selectedExportIds(){return [...document.querySelectorAll('.export-candidate-check:checked')].map(item=>Number(item.value))}
     function updateExportSelection(){const ids=selectedExportIds(),boxes=[...document.querySelectorAll('.export-candidate-check')];document.getElementById('export-selected-count').textContent=`已选 ${ids.length} 条`;const all=document.getElementById('select-all-export');all.checked=boxes.length>0&&ids.length===boxes.length;all.indeterminate=ids.length>0&&ids.length<boxes.length}
     function toggleAllExports(checked){document.querySelectorAll('.export-candidate-check').forEach(item=>item.checked=checked);updateExportSelection()}
     async function batchExportZip(){const ids=selectedExportIds(),box=document.getElementById('batch-export-message'),button=document.getElementById('batch-export-button');if(!ids.length){box.textContent='请先勾选要导出的素材';box.className='message error';return}button.disabled=true;box.textContent=`正在把 ${ids.length} 条现成视频放入 ZIP…`;box.className='message';try{const res=await fetch('/api/candidates/batch-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids})});const data=await res.json();if(!res.ok)throw new Error(errorText(data.detail)||'批量导出失败');box.textContent=`ZIP 已生成，正在交给浏览器下载：${data.filename}`;box.className='message success';button.disabled=false;window.location.assign(data.download_url)}catch(error){box.textContent=error.message;box.className='message error';button.disabled=false}}
-    updateExportSelection()
+    if(document.getElementById('select-all-export'))updateExportSelection()
   </script>
 </body></html>
