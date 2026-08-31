@@ -222,6 +222,10 @@ class Database:
                 "exported_at": "TEXT NOT NULL DEFAULT ''",
                 "media_cleaned_at": "TEXT NOT NULL DEFAULT ''",
                 "media_released_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "render_phase": "TEXT NOT NULL DEFAULT ''",
+                "render_started_at": "TEXT NOT NULL DEFAULT ''",
+                "render_worker": "TEXT NOT NULL DEFAULT ''",
+                "render_encoder": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in migrations.items():
                 if name not in columns:
@@ -286,6 +290,12 @@ class Database:
         with self._lock, self.connect() as conn:
             cursor = conn.execute(sql, tuple(params))
             return int(cursor.lastrowid)
+
+    def execute_changes(self, sql: str, params: Iterable[Any] = ()) -> int:
+        """Execute an update and return affected rows, for atomic job claims."""
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            return int(cursor.rowcount)
 
     def execute_many(self, sql: str, rows: Iterable[Iterable[Any]]) -> None:
         with self._lock, self.connect() as conn:

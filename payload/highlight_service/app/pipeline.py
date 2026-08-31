@@ -291,11 +291,15 @@ class HighlightPipeline:
         self.queue: queue.Queue[Path | None] = queue.Queue()
         self.watcher = SegmentWatcher(settings, db, self.enqueue)
         self._stage_stop = threading.Event()
+        self._render_claim_lock = threading.Lock()
         self._last_room: dict[str, int | None] = {"asr": None, "ai": None, "render": None}
         self._worker = threading.Thread(target=self._work, name="segment-discovery", daemon=True)
         self._asr_worker = threading.Thread(target=self._asr_loop, name="asr-worker-1", daemon=True)
         self._ai_worker = threading.Thread(target=self._ai_loop, name="ai-worker-1", daemon=True)
-        self._render_worker = threading.Thread(target=self._render_loop, name="render-worker-1", daemon=True)
+        self._render_workers = [
+            threading.Thread(target=self._render_loop, args=(index,), name=f"render-worker-{index}", daemon=True)
+            for index in (1, 2)
+        ]
         self._started = False
 
     def start(self) -> None:
@@ -308,6 +312,9 @@ class HighlightPipeline:
         # 数据库是主配置源；启动时也统一回写一次，确保外部手改或异常退出后配置一致。
         self.rooms.sync()
         removed_files, removed_bytes = self.media.cleanup_transient_cache()
+        timeline_files, timeline_bytes = self.media.cleanup_timeline_cache()
+        removed_files += timeline_files
+        removed_bytes += timeline_bytes
         if removed_files:
             self.db.event(
                 "info", "cache_cleanup",
@@ -320,9 +327,14 @@ class HighlightPipeline:
         self._worker.start()
         self._asr_worker.start()
         self._ai_worker.start()
-        self._render_worker.start()
+        for worker in self._render_workers:
+            worker.start()
         self.watcher.start()
-        self.db.event("info", "service", "分阶段公平调度服务已启动（转写/模型/渲染各单并发）")
+        renderer = self.media.renderer_status()
+        self.db.event(
+            "info", "service",
+            f"分阶段公平调度服务已启动（转写/模型单路，渲染{renderer['mode']} · {renderer['encoder']}）",
+        )
 
     def _recover_interrupted_segments(self) -> None:
         """Make process phases left behind by a service restart runnable again."""
@@ -363,8 +375,9 @@ class HighlightPipeline:
                     {"segment_id": segment["id"], "successor_segment_id": successor["id"]},
                 )
                 recovered += 1
-        candidate_recovered = self.db.execute(
-            "UPDATE highlight_candidates SET status='visual_review',updated_at=? WHERE status='rendering'",
+        self.db.execute(
+            """UPDATE highlight_candidates SET status='visual_review',render_phase='',render_started_at='',
+               render_worker='',updated_at=? WHERE status='rendering'""",
             (utc_now(),),
         )
         if recovered:
@@ -379,7 +392,7 @@ class HighlightPipeline:
         self._stage_stop.set()
         self.queue.put(None)
         self._worker.join(timeout=10)
-        for worker in (self._asr_worker, self._ai_worker, self._render_worker):
+        for worker in (self._asr_worker, self._ai_worker, *self._render_workers):
             worker.join(timeout=10)
         self._started = False
 
@@ -591,32 +604,52 @@ class HighlightPipeline:
                 self.db.update_segment_status(segment_id, "error", str(exc))
                 self.db.event("error", "ai", f"模型分析失败：{exc}", {"segment_id": segment_id})
 
-    def _next_fair_candidate(self) -> dict[str, Any] | None:
-        rows = self.db.all(
-            """SELECT h.*,COALESCE(r.sequence,'999999') AS room_sequence
-               FROM highlight_candidates h LEFT JOIN live_rooms r ON r.id=h.room_id
-               WHERE h.status='visual_review'
-               ORDER BY room_sequence,h.id""",
-        )
-        if not rows:
-            return None
-        first_by_room: dict[int, dict[str, Any]] = {}
-        for row in rows:
-            first_by_room.setdefault(int(row.get("room_id") or 0), row)
-        room_ids = list(first_by_room)
-        last = self._last_room.get("render")
-        index = (room_ids.index(last) + 1) % len(room_ids) if last in room_ids else 0
-        chosen_room = room_ids[index]
-        self._last_room["render"] = chosen_room
-        return first_by_room[chosen_room]
+    def _next_fair_candidate(self, worker_name: str = "render-worker-1") -> dict[str, Any] | None:
+        with self._render_claim_lock:
+            rows = self.db.all(
+                """SELECT h.*,COALESCE(r.sequence,'999999') AS room_sequence,
+                          COALESCE(r.name,h.source_id) AS room_name
+                   FROM highlight_candidates h LEFT JOIN live_rooms r ON r.id=h.room_id
+                   WHERE h.status='visual_review'
+                   ORDER BY room_sequence,h.id""",
+            )
+            if not rows:
+                return None
+            first_by_room: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                first_by_room.setdefault(int(row.get("room_id") or 0), row)
+            room_ids = list(first_by_room)
+            last = self._last_room.get("render")
+            index = (room_ids.index(last) + 1) % len(room_ids) if last in room_ids else 0
+            chosen_room = room_ids[index]
+            candidate = first_by_room[chosen_room]
+            now = utc_now()
+            claimed = self.db.execute_changes(
+                """UPDATE highlight_candidates SET status='rendering',render_phase='preparing',
+                   render_started_at=?,render_worker=?,render_encoder=?,updated_at=?
+                   WHERE id=? AND status='visual_review'""",
+                (now, worker_name, self.media.active_encoder, now, candidate["id"]),
+            )
+            if claimed != 1:
+                return None
+            self._last_room["render"] = chosen_room
+            candidate.update(
+                status="rendering", render_phase="preparing", render_started_at=now,
+                render_worker=worker_name, render_encoder=self.media.active_encoder,
+            )
+            return candidate
 
-    def _render_loop(self) -> None:
+    def _render_loop(self, worker_index: int) -> None:
+        worker_name = f"render-worker-{worker_index}"
         while not self._stage_stop.is_set():
-            candidate = self._next_fair_candidate()
+            if worker_index > self.media.render_workers:
+                self._stage_stop.wait(2)
+                continue
+            candidate = self._next_fair_candidate(worker_name)
             if not candidate:
                 self._stage_stop.wait(2)
                 continue
-            self._visual_review_and_render(int(candidate["id"]))
+            self._visual_review_and_render(int(candidate["id"]), worker_name)
 
     def analyze_segment_windows(self, segment: dict[str, Any]) -> None:
         """Analyze each window once and persist progress after every paid request."""
@@ -826,7 +859,7 @@ class HighlightPipeline:
             ),
         )
 
-    def _visual_review_and_render(self, candidate_id: int) -> None:
+    def _visual_review_and_render(self, candidate_id: int, worker_name: str = "render-worker-1") -> None:
         candidate = self.db.one("SELECT * FROM highlight_candidates WHERE id=?", (candidate_id,))
         if not candidate:
             return
@@ -856,22 +889,34 @@ class HighlightPipeline:
             reason = base_reason + "；视觉检查：" + visual_reason
             self.db.execute(
                 """UPDATE highlight_candidates SET product_score=?,confidence=?,risk_json=?,
-                   keyframes_json=?,reason=?,status='rendering',updated_at=? WHERE id=?""",
+                   keyframes_json=?,reason=?,updated_at=? WHERE id=?""",
                 (product_score, confidence, json.dumps(risks, ensure_ascii=False),
                  json.dumps([str(path) for path in frames], ensure_ascii=False),
                  reason, utc_now(), candidate_id),
             )
             candidate = self.db.one("SELECT * FROM highlight_candidates WHERE id=?", (candidate_id,)) or candidate
             output = self.settings.output_dir / "previews" / f"{safe_id(candidate['source_id'])}_{candidate_id}_v{candidate['version']}.mp4"
-            self.media.render_candidate(self.db, candidate, json.loads(candidate["captions_json"]), output)
+            def render_progress(phase: str, encoder: str) -> None:
+                self.db.execute(
+                    """UPDATE highlight_candidates SET render_phase=?,render_encoder=?,updated_at=?
+                       WHERE id=? AND status='rendering'""",
+                    (phase, encoder, utc_now(), candidate_id),
+                )
+
+            self.media.render_candidate(
+                self.db, candidate, json.loads(candidate["captions_json"]), output,
+                progress=render_progress, worker=worker_name,
+            )
             clean_reason = str(candidate.get("reason") or "").split("；渲染失败：", 1)[0]
             self.db.execute(
                   """UPDATE highlight_candidates
-                     SET preview_path=?,status='pending_review',reason=?,render_timeline_version=?,updated_at=? WHERE id=?""",
+                     SET preview_path=?,status='pending_review',reason=?,render_timeline_version=?,
+                         render_phase='complete',updated_at=? WHERE id=?""",
                   (str(output), clean_reason, RENDER_TIMELINE_VERSION, utc_now(), candidate_id),
               )
         except Exception as exc:  # keep candidate reviewable even if preview fails
             self.db.execute(
-                "UPDATE highlight_candidates SET status='render_error',reason=reason||?,updated_at=? WHERE id=?",
+                """UPDATE highlight_candidates SET status='render_error',render_phase='failed',
+                   reason=reason||?,updated_at=? WHERE id=?""",
                 (f"；渲染失败：{str(exc)[:500]}", utc_now(), candidate_id),
             )

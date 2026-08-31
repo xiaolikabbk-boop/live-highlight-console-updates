@@ -5,9 +5,11 @@ import json
 import math
 import subprocess
 import threading
+import time
+import uuid
 from bisect import bisect_left, bisect_right
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image
 
@@ -19,14 +21,87 @@ class MediaError(RuntimeError):
 
 
 class MediaTools:
-    # Automatic previews and manual handoff exports share one FFmpeg lane.
-    # This avoids two CPU/GPU-heavy encodes running at the same time.
-    _render_lock = threading.Lock()
-    _timeline_cache: dict[str, dict[str, Any]] = {}
-    _timeline_lock = threading.Lock()
+    TIMELINE_CACHE_VERSION = 1
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._timeline_cache: dict[str, dict[str, Any]] = {}
+        self._timeline_lock = threading.Lock()
+        self._timeline_path_locks: dict[str, threading.Lock] = {}
+        self._timeline_path_locks_guard = threading.Lock()
+        self._render_slots = threading.BoundedSemaphore(2)
+        self._cpu_render_lock = threading.Lock()
+        self._encoder_lock = threading.Lock()
+        self._active_lock = threading.Lock()
+        self._active_jobs: dict[int, dict[str, Any]] = {}
+        self._gpu_available = False
+        self._active_encoder = "libx264"
+        self._encoder_note = "CPU 编码"
+        self._detect_renderer()
+
+    def _detect_renderer(self) -> None:
+        mode = str(getattr(self.settings, "render_encoder_mode", "auto") or "auto").lower()
+        if mode in {"cpu", "libx264"}:
+            return
+        smoke = self.settings.cache_dir / f"nvenc_probe_{uuid.uuid4().hex}.mp4"
+        smoke.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            encoders = self._run([
+                str(self.settings.ffmpeg_path), "-hide_banner", "-encoders",
+            ], timeout=20)
+            if "h264_nvenc" not in (encoders.stdout + encoders.stderr):
+                self._encoder_note = "FFmpeg 未提供 NVENC，已使用 CPU"
+                return
+            self._run([
+                str(self.settings.ffmpeg_path), "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=256x256:r=1:d=1",
+                "-frames:v", "1", "-c:v", "h264_nvenc", "-preset", "p5", "-cq", "21",
+                str(smoke),
+            ], timeout=25)
+        except Exception as exc:  # NVIDIA-less machines must start normally.
+            self._encoder_note = f"NVENC 不可用，已使用 CPU：{str(exc)[-160:]}"
+            return
+        finally:
+            smoke.unlink(missing_ok=True)
+        self._gpu_available = True
+        self._active_encoder = "h264_nvenc"
+        self._encoder_note = "NVIDIA NVENC 可用"
+
+    @property
+    def render_workers(self) -> int:
+        with self._encoder_lock:
+            return 2 if self._active_encoder == "h264_nvenc" else 1
+
+    @property
+    def active_encoder(self) -> str:
+        with self._encoder_lock:
+            return self._active_encoder
+
+    def renderer_status(self) -> dict[str, Any]:
+        with self._active_lock:
+            jobs = [dict(value) for value in self._active_jobs.values()]
+        encoder = self.active_encoder
+        return {
+            "encoder": encoder,
+            "mode": "GPU双路" if encoder == "h264_nvenc" else "CPU单路",
+            "workers": self.render_workers,
+            "note": self._encoder_note,
+            "jobs": jobs,
+        }
+
+    def _set_job_phase(
+        self, candidate_id: int, phase: str, *, room: str = "", worker: str = ""
+    ) -> None:
+        with self._active_lock:
+            existing = self._active_jobs.get(candidate_id, {})
+            self._active_jobs[candidate_id] = {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "room": room or existing.get("room", ""),
+                "worker": worker or existing.get("worker", ""),
+                "started_at": existing.get("started_at", time.time()),
+                "encoder": self.active_encoder,
+            }
 
     def _run(self, args: list[str], timeout: int = 300) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
@@ -218,52 +293,134 @@ class MediaTools:
         # score is advisory and never rejects a clip on its own.
         return round(max(0.05, min(0.95, 1 - sum(distances) / len(distances))), 3)
 
-    def _stream_timeline(self, path: Path) -> dict[str, Any]:
+    def _timeline_fingerprint(self, path: Path) -> dict[str, Any]:
+        resolved = path.resolve()
+        stat = resolved.stat()
+        return {"path": str(resolved), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+    def _timeline_cache_path(self, resolved_path: str) -> Path:
+        key = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()
+        return self.settings.cache_dir / "timelines" / f"{key}.json"
+
+    def _timeline_path_lock(self, resolved_path: str) -> threading.Lock:
+        with self._timeline_path_locks_guard:
+            return self._timeline_path_locks.setdefault(resolved_path, threading.Lock())
+
+    def cleanup_timeline_cache(self) -> tuple[int, int]:
+        removed = removed_bytes = 0
+        folder = self.settings.cache_dir / "timelines"
+        if not folder.exists():
+            return 0, 0
+        for cache_file in folder.glob("*.json"):
+            try:
+                size = cache_file.stat().st_size
+                payload = json.loads(cache_file.read_text(encoding="utf-8"))
+                source = payload.get("source") or {}
+                source_path = Path(str(source.get("path") or ""))
+                if (payload.get("version") != self.TIMELINE_CACHE_VERSION
+                        or not source_path.exists()
+                        or self._timeline_fingerprint(source_path) != source):
+                    cache_file.unlink(missing_ok=True)
+                    removed += 1
+                    removed_bytes += size
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                try:
+                    size = cache_file.stat().st_size
+                    cache_file.unlink(missing_ok=True)
+                    removed += 1
+                    removed_bytes += size
+                except OSError:
+                    pass
+        return removed, removed_bytes
+
+    def invalidate_timeline(self, path: Path) -> None:
+        resolved = str(path.resolve())
+        with self._timeline_lock:
+            for key in [key for key in self._timeline_cache if key.startswith(resolved + "|")]:
+                self._timeline_cache.pop(key, None)
+        self._timeline_cache_path(resolved).unlink(missing_ok=True)
+
+    def _stream_timeline(
+        self, path: Path, progress: Callable[[str], None] | None = None
+    ) -> dict[str, Any]:
         """Map decoded audio time back to source PTS and matching video frames."""
-        key = str(path.resolve())
+        fingerprint = self._timeline_fingerprint(path)
+        resolved = str(fingerprint["path"])
+        key = f"{resolved}|{fingerprint['size']}|{fingerprint['mtime_ns']}"
         with self._timeline_lock:
             cached = self._timeline_cache.get(key)
         if cached:
+            if progress:
+                progress("timeline_cached")
             return cached
+        cache_path = self._timeline_cache_path(resolved)
+        with self._timeline_path_lock(resolved):
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                if (payload.get("version") == self.TIMELINE_CACHE_VERSION
+                        and payload.get("source") == fingerprint):
+                    timeline = payload["timeline"]
+                    with self._timeline_lock:
+                        self._timeline_cache[key] = timeline
+                    if progress:
+                        progress("timeline_cached")
+                    return timeline
+            except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            if progress:
+                progress("scanning_timeline")
+            audio_result = self._run([
+                str(self.settings.ffprobe_path), "-v", "error", "-select_streams", "a:0",
+                "-show_packets", "-show_entries", "packet=pts_time,duration_time", "-of", "json", resolved,
+            ], timeout=180)
+            video_result = self._run([
+                str(self.settings.ffprobe_path), "-v", "error", "-select_streams", "v:0",
+                "-show_frames", "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", resolved,
+            ], timeout=180)
+            audio_packets = json.loads(audio_result.stdout).get("packets", [])
+            video_frames = json.loads(video_result.stdout).get("frames", [])
+            audio_starts: list[float] = []
+            audio_pts: list[float] = []
+            audio_durations: list[float] = []
+            elapsed = 0.0
+            for packet in audio_packets:
+                if packet.get("pts_time") is None:
+                    continue
+                duration = float(packet.get("duration_time") or (1024 / 48000))
+                audio_starts.append(elapsed)
+                audio_pts.append(float(packet["pts_time"]))
+                audio_durations.append(duration)
+                elapsed += duration
+            frame_pts = [
+                float(frame["best_effort_timestamp_time"])
+                for frame in video_frames if frame.get("best_effort_timestamp_time") is not None
+            ]
+            if not audio_starts or not frame_pts:
+                raise MediaError("无法建立录像音画时间轴")
+            timeline = {
+                "audio_starts": audio_starts, "audio_pts": audio_pts,
+                "audio_durations": audio_durations, "video_pts": frame_pts,
+            }
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+            try:
+                temp_path.write_text(json.dumps({
+                    "version": self.TIMELINE_CACHE_VERSION,
+                    "source": fingerprint,
+                    "timeline": timeline,
+                }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+                temp_path.replace(cache_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
+            with self._timeline_lock:
+                self._timeline_cache[key] = timeline
+            return timeline
 
-        audio_result = self._run([
-            str(self.settings.ffprobe_path), "-v", "error", "-select_streams", "a:0",
-            "-show_packets", "-show_entries", "packet=pts_time,duration_time", "-of", "json", key,
-        ], timeout=180)
-        video_result = self._run([
-            str(self.settings.ffprobe_path), "-v", "error", "-select_streams", "v:0",
-            "-show_frames", "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", key,
-        ], timeout=180)
-        audio_packets = json.loads(audio_result.stdout).get("packets", [])
-        video_frames = json.loads(video_result.stdout).get("frames", [])
-        audio_starts: list[float] = []
-        audio_pts: list[float] = []
-        audio_durations: list[float] = []
-        elapsed = 0.0
-        for packet in audio_packets:
-            if packet.get("pts_time") is None:
-                continue
-            duration = float(packet.get("duration_time") or (1024 / 48000))
-            audio_starts.append(elapsed)
-            audio_pts.append(float(packet["pts_time"]))
-            audio_durations.append(duration)
-            elapsed += duration
-        frame_pts = [
-            float(frame["best_effort_timestamp_time"])
-            for frame in video_frames if frame.get("best_effort_timestamp_time") is not None
-        ]
-        if not audio_starts or not frame_pts:
-            raise MediaError("无法建立录像音画时间轴")
-        timeline = {
-            "audio_starts": audio_starts, "audio_pts": audio_pts,
-            "audio_durations": audio_durations, "video_pts": frame_pts,
-        }
-        with self._timeline_lock:
-            self._timeline_cache[key] = timeline
-        return timeline
-
-    def _synced_video_frame(self, path: Path, decoded_audio_seconds: float) -> int:
-        timeline = self._stream_timeline(path)
+    def _synced_video_frame(
+        self, path: Path, decoded_audio_seconds: float,
+        progress: Callable[[str], None] | None = None,
+    ) -> int:
+        timeline = self._stream_timeline(path, progress)
         starts = timeline["audio_starts"]
         packet_index = max(0, min(len(starts) - 1, bisect_right(starts, decoded_audio_seconds) - 1))
         within_packet = max(0.0, decoded_audio_seconds - starts[packet_index])
@@ -322,9 +479,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         candidate: dict[str, Any],
         captions: list[dict[str, Any]],
         destination: Path,
+        progress: Callable[[str, str], None] | None = None,
+        worker: str = "",
     ) -> Path:
-        with self._render_lock:
-            return self._render_candidate(db, candidate, captions, destination)
+        candidate_id = int(candidate.get("id") or 0)
+        room = str(candidate.get("room_name") or candidate.get("source_id") or "")
+
+        def report(phase: str, encoder: str = "") -> None:
+            self._set_job_phase(candidate_id, phase, room=room, worker=worker)
+            if progress:
+                progress(phase, encoder or self.active_encoder)
+
+        with self._render_slots:
+            report("preparing")
+            try:
+                return self._render_candidate(db, candidate, captions, destination, report)
+            finally:
+                with self._active_lock:
+                    self._active_jobs.pop(candidate_id, None)
 
     def _render_candidate(
         self,
@@ -332,6 +504,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         candidate: dict[str, Any],
         captions: list[dict[str, Any]],
         destination: Path,
+        progress: Callable[[str], None] | None = None,
     ) -> Path:
         raw_ranges = candidate.get("source_ranges_json") or candidate.get("source_ranges") or []
         if isinstance(raw_ranges, str):
@@ -380,8 +553,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             video = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"), {})
             audio = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"), {})
             sample_rate = int(audio.get("sample_rate") or 48000)
-            start_frame = self._synced_video_frame(item["path"], float(item["start"]))
-            end_frame = max(start_frame + 1, self._synced_video_frame(item["path"], float(item["end"])))
+            start_frame = self._synced_video_frame(item["path"], float(item["start"]), progress)
+            end_frame = max(start_frame + 1, self._synced_video_frame(item["path"], float(item["end"]), progress))
             start_sample = max(0, round(float(item["start"]) * sample_rate))
             end_sample = max(start_sample + 1, round(float(item["end"]) * sample_rate))
             part_duration = float(item["end"]) - float(item["start"])
@@ -396,6 +569,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={max(0, part_duration-fade):.3f}:d={fade:.3f}[a{index}]"
             )
             concat_inputs.append(f"[v{index}][a{index}]")
+        if progress:
+            progress("composing")
         chains.append("".join(concat_inputs) + f"concat=n={len(pieces)}:v=1:a=1[vc][ac]")
         video_output = "[vc]"
         subtitle_path: Path | None = None
@@ -406,19 +581,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             chains.append(f"[vc]subtitles=filename='{subtitle_filter_path}'[vout]")
             video_output = "[vout]"
         filter_complex = ";".join(chains)
-        encoder_args = ["-c:v", self.settings.video_encoder]
-        if self.settings.video_encoder == "libx264":
-            encoder_args += ["-preset", "medium", "-crf", "20"]
-        else:
-            encoder_args += ["-preset", "p5", "-cq", "21"]
         destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
+
+        def encode(encoder: str) -> None:
+            encoder_args = ["-c:v", encoder]
+            if encoder == "libx264":
+                encoder_args += ["-preset", "medium", "-crf", "20"]
+            else:
+                encoder_args += ["-preset", "p5", "-cq", "21"]
+            if progress:
+                progress("encoding", encoder)
             self._run([
                 str(self.settings.ffmpeg_path), "-y", "-hide_banner", "-loglevel", "error",
                 *input_args, "-filter_complex", filter_complex,
                 "-map", video_output, "-map", "[ac]", *encoder_args, "-c:a", "aac", "-b:a", "160k",
                 "-movflags", "+faststart", str(destination),
             ], timeout=900)
+
+        try:
+            encoder = self.active_encoder
+            if encoder == "libx264":
+                with self._cpu_render_lock:
+                    encode(encoder)
+            else:
+                try:
+                    encode(encoder)
+                except Exception as nvenc_exc:
+                    destination.unlink(missing_ok=True)
+                    with self._encoder_lock:
+                        self._active_encoder = "libx264"
+                        self._gpu_available = False
+                        self._encoder_note = f"NVENC 运行失败，已自动回退 CPU：{str(nvenc_exc)[-160:]}"
+                    if progress:
+                        progress("gpu_fallback", "libx264")
+                    with self._cpu_render_lock:
+                        encode("libx264")
+            if progress:
+                progress("complete", self.active_encoder)
         except Exception:
             destination.unlink(missing_ok=True)
             raise

@@ -32,8 +32,8 @@ from .text_normalize import simplify_value, to_simplified
 
 
 db = Database(settings.db_path)
-media = MediaTools(settings)
 pipeline = HighlightPipeline(settings, db)
+media = pipeline.media
 templates = Jinja2Templates(directory=str(settings.service_root / "app" / "templates"))
 
 
@@ -504,6 +504,13 @@ def _recent_time_text(value: str) -> tuple[str, float | None]:
 
 
 def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
+    renderer = pipeline.media.renderer_status()
+    render_active = db.all(
+        """SELECT h.id,h.source_id,h.render_phase,h.render_started_at,h.render_worker,
+                  h.render_encoder,h.updated_at,r.sequence,r.name AS room_name
+           FROM highlight_candidates h LEFT JOIN live_rooms r ON r.id=h.room_id
+           WHERE h.status='rendering' ORDER BY h.render_started_at,h.id LIMIT 2"""
+    )
     stage_specs = [
         {
             "key": "asr", "title": "本机转写", "waiting": int(totals["waiting_asr"]),
@@ -528,13 +535,10 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             "noun": "分片",
         },
         {
-            "key": "render", "title": "视频渲染", "waiting": int(totals["waiting_render"]),
+            "key": "render", "title": f"视频渲染 · {renderer['mode']}", "waiting": int(totals["waiting_render"]),
             "warn": 10 * 60, "danger": 25 * 60,
-            "active": db.one(
-                """SELECT h.id,h.source_id,h.updated_at,r.sequence,r.name AS room_name
-                   FROM highlight_candidates h LEFT JOIN live_rooms r ON r.id=h.room_id
-                   WHERE h.status='rendering' ORDER BY h.updated_at LIMIT 1"""
-            ),
+            "active": render_active[0] if render_active else None,
+            "active_items": render_active,
             "last": (db.one(
                 """SELECT MAX(updated_at) AS value FROM highlight_candidates
                    WHERE preview_path<>'' AND status NOT IN ('visual_review','rendering')"""
@@ -554,12 +558,30 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             "elapsed": "—", "hint": "队列为空，运行正常",
         }
         if active:
-            started = _database_time(str(active.get("updated_at") or ""))
+            started = _database_time(str(active.get("render_started_at") or active.get("updated_at") or ""))
             elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
             room_label = " · ".join(part for part in (
                 str(active.get("sequence") or ""), str(active.get("room_name") or active.get("source_id") or "")
             ) if part)
             item["current"] = f"{spec['noun']} #{active['id']}" + (f" · {room_label}" if room_label else "")
+            if spec["key"] == "render":
+                phase_labels = {
+                    "preparing": "准备素材", "scanning_timeline": "扫描音画时间轴",
+                    "timeline_cached": "复用时间轴缓存", "composing": "裁切拼接",
+                    "encoding": "视频编码", "gpu_fallback": "显卡失败，切换 CPU",
+                    "complete": "完成", "failed": "失败",
+                }
+                descriptions = []
+                for job in spec.get("active_items", []):
+                    label = phase_labels.get(str(job.get("render_phase") or ""), "准备素材")
+                    room = " · ".join(part for part in (
+                        str(job.get("sequence") or ""), str(job.get("room_name") or job.get("source_id") or "")
+                    ) if part)
+                    descriptions.append(
+                        f"#{job['id']} {room} · {label} · {job.get('render_encoder') or renderer['encoder']}"
+                    )
+                item["current"] = "；".join(descriptions)
+                item["hint"] = f"实际编码器 {renderer['encoder']}；{renderer['note']}"
             item["elapsed"] = _elapsed_text(elapsed)
             if elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能卡住", hint="单项运行时间明显过长，建议查看任务管理器或错误日志")
@@ -567,6 +589,8 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
                 item.update(state="slow", state_label="处理较慢", hint="任务仍在运行，可继续观察CPU和队列变化")
             else:
                 item.update(state="working", state_label="正常处理中", hint="检测到当前任务，处理线程正在工作")
+                if spec["key"] == "render":
+                    item["hint"] = f"实际编码器 {renderer['encoder']}；{renderer['note']}"
         elif spec["waiting"]:
             if last_elapsed is not None and last_elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能停滞", current="有任务积压，但当前未检测到处理项", hint="最近完成时间较久，建议刷新后继续观察或查看运行日志")
@@ -1268,24 +1292,37 @@ def render_candidate(candidate_id: int, payload: RenderRequest) -> dict[str, Any
     version = int(candidate["version"]) + 1
     db.execute(
         """UPDATE highlight_candidates SET start_time=?,end_time=?,captions_json=?,source_ranges_json=?,
-           version=?,status='rendering',updated_at=? WHERE id=?""",
+           version=?,status='rendering',render_phase='preparing',render_started_at=?,
+           render_worker='manual',render_encoder=?,updated_at=? WHERE id=?""",
         (
             float(ranges[0]["start"]), float(ranges[-1]["end"]), json.dumps(captions, ensure_ascii=False),
             json.dumps(ranges, ensure_ascii=False),
-            version, utc_now(), candidate_id,
+            version, utc_now(), media.active_encoder, utc_now(), candidate_id,
         ),
     )
     candidate = get_candidate(candidate_id)
     destination = settings.output_dir / "previews" / f"{safe_id(candidate['source_id'])}_{candidate_id}_v{version}.mp4"
     try:
-        media.render_candidate(db, candidate, captions, destination)
+        def render_progress(phase: str, encoder: str) -> None:
+            db.execute(
+                """UPDATE highlight_candidates SET render_phase=?,render_encoder=?,updated_at=?
+                   WHERE id=? AND status='rendering'""",
+                (phase, encoder, utc_now(), candidate_id),
+            )
+
+        media.render_candidate(
+            db, candidate, captions, destination, progress=render_progress, worker="manual"
+        )
     except MediaError as exc:
-        db.execute("UPDATE highlight_candidates SET status='render_error',updated_at=? WHERE id=?", (utc_now(), candidate_id))
+        db.execute(
+            """UPDATE highlight_candidates SET status='render_error',render_phase='failed',
+               updated_at=? WHERE id=?""", (utc_now(), candidate_id)
+        )
         raise HTTPException(500, str(exc)) from exc
     clean_reason = str(candidate.get("reason") or "").split("；渲染失败：", 1)[0]
     db.execute(
         """UPDATE highlight_candidates
-           SET preview_path=?,status='pending_review',reason=?,updated_at=? WHERE id=?""",
+           SET preview_path=?,status='pending_review',reason=?,render_phase='complete',updated_at=? WHERE id=?""",
         (str(destination), clean_reason, utc_now(), candidate_id),
     )
     return {"ok": True, "candidate": get_candidate(candidate_id)}

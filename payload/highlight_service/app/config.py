@@ -79,7 +79,12 @@ class Settings:
     duplicate_overlap_ratio: float = 0.70
     max_source_ranges: int = 5
     range_merge_gap_seconds: float = 0.45
+    # "auto" probes the bundled FFmpeg and the installed NVIDIA driver.  Old
+    # installations may still carry video_encoder=libx264 in settings.json;
+    # render_encoder_mode deliberately takes precedence so the upgrade can
+    # enable acceleration without rewriting a user's configuration file.
     video_encoder: str = "libx264"
+    render_encoder_mode: str = "auto"
     burn_subtitles: bool = False
     candidate_media_retention_days: int = 7
 

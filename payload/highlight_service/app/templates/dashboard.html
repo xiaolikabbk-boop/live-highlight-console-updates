@@ -21,12 +21,12 @@
   </section>
   <section class="scheduler-strip">
     {% for stage in processing_health %}<article class="stage-health stage-{{ stage.state }}">
-      <header><b>{{ stage.title }} · 单路</b><span class="stage-state"><i></i>{{ stage.state_label }}</span></header>
+      <header><b>{{ stage.title }}{% if stage.key != 'render' %} · 单路{% endif %}</b><span class="stage-state"><i></i>{{ stage.state_label }}</span></header>
       <p class="stage-current">{{ stage.current }}</p>
       <div class="stage-facts"><span>队列等待 <b>{{ stage.waiting }}</b></span><span>本项已运行 <b>{{ stage.elapsed }}</b></span></div>
       <p class="stage-last">最近完成：{{ stage.last_completed }}</p><small>{{ stage.hint }}</small>
     </article>{% endfor %}
-    <p class="scheduler-note">页面每30秒自动自检。不同直播间轮流处理；单路运行用于避免CPU、硬盘和模型请求同时过载。</p>
+    <p class="scheduler-note">页面每30秒自动自检。转写和模型保持单路；渲染会自动检测显卡，NVENC 可用时双路，不可用或失败时自动回退 CPU 单路。</p>
   </section>
   <details class="runtime-log"><summary>运行日志与当前录制情况</summary><div class="runtime-log-body">
     {% for room in rooms %}<p><b>{{ room.sequence }} · {{ room.name }}</b>：{% if room.recording_active %}<span class="log-good">正在录制，已录 {{ room.active_elapsed_text }}，{{ room.active_size_mb }} MB，文件持续写入</span>{% elif room.enabled and room.live_state == 'live' %}<span class="log-wait">直播中，已开启录制，等待录制器建立文件</span>{% elif room.enabled %}已开启录制，当前未开播{% else %}录制暂停；静默状态检测仍在运行{% endif %}</p>{% endfor %}
