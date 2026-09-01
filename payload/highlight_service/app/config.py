@@ -81,7 +81,7 @@ class Settings:
     guardian_ai_model: str = "gpt-5.5"
     guardian_vision_api_key: str = ""
     guardian_vision_model: str = "gpt-5.5"
-    guardian_ai_protocol: str = "chat"
+    guardian_ai_protocol: str = "responses"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-v4-pro"

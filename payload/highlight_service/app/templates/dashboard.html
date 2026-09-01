@@ -34,7 +34,7 @@
     {% for event in recent_events %}<p class="event-line"><time>{{ event.created_at }}</time> {{ event.message }}</p>{% endfor %}
   </div></details>
   <section id="guardian-modal" class="room-modal hidden" role="dialog" aria-modal="true" aria-labelledby="guardian-title" onclick="if(event.target===this)closeGuardian()"><div class="room-dialog guardian-dialog">
-    <div class="guardian-head"><div><h2 id="guardian-title">AI管家</h2><p>本地自检始终可用；配置 GPT‑5.5 后可增强问答和截图分析。</p></div><button class="secondary" onclick="closeGuardian()">关闭</button></div>
+    <div class="guardian-head"><div><h2 id="guardian-title">AI管家</h2><p>本地自检始终可用；默认复用主线路 GPT‑5.5，也可配置独立管家密钥。</p></div><button class="secondary" onclick="closeGuardian()">关闭</button></div>
     <div class="guardian-quick"><button onclick="sendGuardian('播报当前程序状态')">播报状态</button><button onclick="sendGuardian('诊断当前异常和卡住原因')">诊断异常</button><button onclick="sendGuardian('导出脱敏诊断数据包')">导出诊断包</button><button onclick="sendGuardian('继续尝试异常任务')">继续尝试</button><button class="danger" onclick="sendGuardian('舍弃这批异常任务')">舍弃异常任务</button></div>
     <div id="guardian-chat" class="guardian-chat"><div class="guardian-message assistant">你好，我可以查看任务状态、定位异常、分析截图、生成脱敏诊断包，并在你明确确认后暂停或恢复故障任务。</div></div>
     <div id="guardian-action" class="guardian-action hidden"></div>

@@ -119,7 +119,7 @@ class Guardian:
 
     def _remote_request(self, message: str, snapshot: dict[str, Any], image: tuple[bytes, str] | None = None) -> dict[str, Any]:
         base_url = (self.settings.guardian_ai_base_url or self.settings.ai_base_url).rstrip("/")
-        api_key = self.settings.guardian_ai_api_key
+        api_key = self.settings.guardian_ai_api_key or self.settings.ai_api_key
         model = self.settings.guardian_ai_model or "gpt-5.5"
         if image:
             api_key = self.settings.guardian_vision_api_key or api_key
@@ -167,24 +167,58 @@ class Guardian:
                 {"type": "text", "text": user_text + "\n请结合截图判断，但以数据库状态为准。"},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}", "detail": "low"}},
             ]
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": GUARDIAN_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-            "max_tokens": 1200,
-        }
+        protocol = str(self.settings.guardian_ai_protocol or "responses").lower()
+        if protocol not in {"responses", "chat", "auto"}:
+            raise RuntimeError("不支持的管家模型协议：" + protocol)
+        if protocol in {"responses", "auto"}:
+            response_content: Any = user_text
+            if image:
+                raw, mime = image
+                encoded = base64.b64encode(raw).decode("ascii")
+                response_content = [
+                    {"type": "input_text", "text": user_text + "\n请结合截图判断，但以数据库状态为准。"},
+                    {"type": "input_image", "image_url": f"data:{mime};base64,{encoded}", "detail": "low"},
+                ]
+            endpoint = "/responses"
+            payload = {
+                "model": model,
+                "input": [
+                    {"role": "system", "content": GUARDIAN_SYSTEM_PROMPT},
+                    {"role": "user", "content": response_content},
+                ],
+                "temperature": 0.1,
+                "max_output_tokens": 1200,
+            }
+        else:
+            endpoint = "/chat/completions"
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": GUARDIAN_SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1,
+                "max_tokens": 1200,
+            }
         response = httpx.post(
-            base_url + "/chat/completions",
+            base_url + endpoint,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload, timeout=120,
         )
         response.raise_for_status()
         data = response.json()
-        raw_text = data["choices"][0]["message"]["content"]
+        raw_text = data.get("output_text")
+        if not isinstance(raw_text, str):
+            for output in data.get("output") or []:
+                for item in output.get("content") or []:
+                    if isinstance(item.get("text"), str):
+                        raw_text = item["text"]
+                        break
+                if isinstance(raw_text, str):
+                    break
+        if not isinstance(raw_text, str):
+            raw_text = data["choices"][0]["message"]["content"]
         match = re.search(r"\{.*\}", raw_text, flags=re.S)
         result = json.loads(match.group(0) if match else raw_text)
         return {

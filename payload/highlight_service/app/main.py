@@ -1063,6 +1063,7 @@ def open_model_key_config() -> dict[str, Any]:
         ("HIGHLIGHT_GUARDIAN_AI_MODEL", "gpt-5.5"),
         ("HIGHLIGHT_GUARDIAN_VISION_API_KEY", ""),
         ("HIGHLIGHT_GUARDIAN_VISION_MODEL", "gpt-5.5"),
+        ("HIGHLIGHT_GUARDIAN_AI_PROTOCOL", "responses"),
     ]
     missing = [(key, value) for key, value in defaults if key not in present]
     if missing:
