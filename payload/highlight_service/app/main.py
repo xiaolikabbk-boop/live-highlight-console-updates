@@ -325,8 +325,14 @@ def room_cards() -> list[dict[str, Any]]:
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status='transcribing') AS active_asr,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('transcribed','ai_waiting')) AS waiting_ai,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('gpt_analyzing','deepseek_analyzing')) AS active_ai,
-           (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='visual_review') AS waiting_render,
+           (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='visual_review'
+              AND EXISTS (SELECT 1 FROM recording_segments s WHERE s.session_id=h.session_id
+                AND NOT(s.timeline_end<=h.start_time OR s.timeline_start>=h.end_time))
+              AND NOT EXISTS (SELECT 1 FROM recording_segments s WHERE s.session_id=h.session_id
+                AND NOT(s.timeline_end<=h.start_time OR s.timeline_start>=h.end_time)
+                AND s.status NOT IN ('complete','analyzed'))) AS waiting_render,
            (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='rendering') AS active_render,
+           (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='render_error') AS render_error_count,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.analyzed_at<>'' AND s.status<>'cleaned') AS segment_processed,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('error','asr_unavailable')) AS segment_errors,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status<>'cleaned' AND EXISTS(
@@ -426,7 +432,7 @@ def segment_cleanup_report(segment_id: int) -> dict[str, Any]:
         candidate for candidate in db.all(
             "SELECT * FROM highlight_candidates WHERE session_id=? ORDER BY id", (segment["session_id"],)
         ) if _candidate_overlaps_segment(candidate, segment)
-        and candidate["status"] not in {"superseded", "render_error"}
+        and candidate["status"] != "superseded"
     ]
     blockers: list[str] = []
     dispositions: list[dict[str, Any]] = []
@@ -450,6 +456,9 @@ def segment_cleanup_report(segment_id: int) -> dict[str, Any]:
         elif status == "accepted":
             blockers.append(f"候选 #{candidate['id']} 已接受但尚未导出成片")
             disposition = "等待导出"
+        elif status == "render_error":
+            blockers.append(f"候选 #{candidate['id']} 渲染异常，必须保留原录像以便重试")
+            disposition = "渲染异常待恢复"
         else:
             blockers.append(f"候选 #{candidate['id']} 尚未明确去向")
             disposition = "待审核"
@@ -643,6 +652,7 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
                 phase_labels = {
                     "preparing": "准备素材", "scanning_timeline": "扫描音画时间轴",
                     "timeline_cached": "复用时间轴缓存", "composing": "裁切拼接",
+                    "timeline_fallback": "快速估算时间轴",
                     "encoding": "视频编码", "gpu_fallback": "显卡失败，切换 CPU",
                     "complete": "完成", "failed": "失败",
                 }
@@ -778,6 +788,7 @@ def control_center(request: Request) -> HTMLResponse:
         "active_asr": sum(int(room["active_asr"]) for room in cards),
         "active_ai": sum(int(room["active_ai"]) for room in cards),
         "active_render": sum(int(room["active_render"]) for room in cards),
+        "render_errors": sum(int(room["render_error_count"]) for room in cards),
     }
     recent_events = db.all(
         "SELECT level,event_type,message,created_at FROM service_events ORDER BY id DESC LIMIT 12"
@@ -958,7 +969,14 @@ def health() -> dict[str, Any]:
         "stage_queues": {
             "waiting_asr": db.one("SELECT COUNT(id) count FROM recording_segments WHERE status='discovered'")["count"],
             "waiting_ai": db.one("SELECT COUNT(id) count FROM recording_segments WHERE status IN ('transcribed','ai_waiting')")["count"],
-            "waiting_render": db.one("SELECT COUNT(id) count FROM highlight_candidates WHERE status='visual_review'")["count"],
+            "waiting_render": db.one(
+                """SELECT COUNT(h.id) count FROM highlight_candidates h WHERE h.status='visual_review'
+                   AND EXISTS (SELECT 1 FROM recording_segments s WHERE s.session_id=h.session_id
+                     AND NOT(s.timeline_end<=h.start_time OR s.timeline_start>=h.end_time))
+                   AND NOT EXISTS (SELECT 1 FROM recording_segments s WHERE s.session_id=h.session_id
+                     AND NOT(s.timeline_end<=h.start_time OR s.timeline_start>=h.end_time)
+                     AND s.status NOT IN ('complete','analyzed'))"""
+            )["count"],
         },
         "asr_available": pipeline.transcriber.available,
         "cloud_text_enabled": pipeline.analyzer.cloud.text_enabled,
@@ -1350,7 +1368,7 @@ def cleanup_segment(segment_id: int, payload: SegmentCleanupRequest) -> dict[str
         candidate for candidate in db.all(
             "SELECT * FROM highlight_candidates WHERE session_id=?", (segment["session_id"],)
         ) if _candidate_overlaps_segment(candidate, segment)
-        and candidate["status"] not in {"superseded", "render_error"}
+        and candidate["status"] != "superseded"
     ]
     input_root = settings.input_dir.resolve()
     data_roots = [settings.output_dir.resolve(), settings.cache_dir.resolve(), settings.keyframe_dir.resolve()]

@@ -98,7 +98,11 @@ class OpenAICompatibleClient:
                     raise AIUnavailable(f"中转站暂时不可用（HTTP {response.status_code}）")
                 response.raise_for_status()
                 return response.json()
-            except (httpx.TimeoutException, httpx.NetworkError, AIUnavailable) as exc:
+            # RequestError also covers RemoteProtocolError (the upstream server
+            # closed the connection without a response), TLS failures and the
+            # other transport errors that used to become permanent segment
+            # failures after a single attempt.
+            except (httpx.RequestError, json.JSONDecodeError, AIUnavailable) as exc:
                 last_error = exc
                 if attempt + 1 < self.settings.ai_max_attempts:
                     time.sleep(min(8, 2 ** attempt))
@@ -114,8 +118,9 @@ class OpenAICompatibleClient:
         errors: list[str] = []
         if protocol in {"auto", "responses"}:
             try:
-                data = self._post("/responses", {"model": model, "input": messages, "temperature": 0.1})
-                return _extract_json(self._response_text(data))
+                return self._parsed_post(
+                    "/responses", {"model": model, "input": messages, "temperature": 0.1}
+                )
             except AIUnavailable as exc:
                 errors.append(str(exc))
                 if protocol == "responses" or not any(code in str(exc) for code in ("400", "404", "405", "422")):
@@ -130,9 +135,25 @@ class OpenAICompatibleClient:
                 payload["thinking"] = {"type": self.settings.ai_thinking_mode}
             if self.settings.ai_thinking_mode != "enabled":
                 payload["temperature"] = 0.1
-            data = self._post("/chat/completions", payload)
-            return _extract_json(self._response_text(data))
+            return self._parsed_post("/chat/completions", payload)
         raise AIUnavailable("不支持的 AI 协议配置：" + protocol + "; ".join(errors))
+
+    def _parsed_post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Retry empty, truncated and non-JSON model responses as transient failures."""
+        last_error: Exception | None = None
+        for attempt in range(self.settings.ai_max_attempts):
+            try:
+                data = self._post(endpoint, payload)
+                return _extract_json(self._response_text(data))
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError, IndexError) as exc:
+                last_error = exc
+                if attempt + 1 < self.settings.ai_max_attempts:
+                    time.sleep(min(8, 2 ** attempt))
+                    continue
+        raise AIUnavailable(
+            "模型连续返回空内容、截断内容或无效 JSON，任务已保留等待重试："
+            + str(last_error or "无法解析模型响应")
+        ) from last_error
 
     def analyze_clauses(self, clauses: list[Clause], task_instruction: str = "") -> list[dict[str, Any]]:
         if not self.text_enabled:

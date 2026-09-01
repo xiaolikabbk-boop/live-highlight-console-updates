@@ -611,6 +611,17 @@ class HighlightPipeline:
                           COALESCE(r.name,h.source_id) AS room_name
                    FROM highlight_candidates h LEFT JOIN live_rooms r ON r.id=h.room_id
                    WHERE h.status='visual_review'
+                     AND EXISTS (
+                       SELECT 1 FROM recording_segments s
+                       WHERE s.session_id=h.session_id
+                         AND NOT(s.timeline_end<=h.start_time OR s.timeline_start>=h.end_time)
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM recording_segments s
+                       WHERE s.session_id=h.session_id
+                         AND NOT(s.timeline_end<=h.start_time OR s.timeline_start>=h.end_time)
+                         AND s.status NOT IN ('complete','analyzed')
+                     )
                    ORDER BY room_sequence,h.id""",
             )
             if not rows:

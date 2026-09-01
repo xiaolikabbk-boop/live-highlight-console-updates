@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from bisect import bisect_left, bisect_right
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,7 +22,7 @@ class MediaError(RuntimeError):
 
 
 class MediaTools:
-    TIMELINE_CACHE_VERSION = 1
+    TIMELINE_CACHE_VERSION = 2
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -148,8 +149,7 @@ class MediaTools:
     def segments_for_range(self, db: Any, session_id: str, start: float, end: float) -> list[dict[str, Any]]:
         return db.all(
             """SELECT * FROM recording_segments
-               WHERE session_id=? AND status IN
-                 ('transcribed','gpt_analyzing','deepseek_analyzing','analyzed','complete','ai_waiting')
+               WHERE session_id=? AND status IN ('analyzed','complete')
                  AND NOT(timeline_end<=? OR timeline_start>=?)
                ORDER BY timeline_start""",
             (session_id, start, end),
@@ -346,6 +346,20 @@ class MediaTools:
         except (FileNotFoundError, OSError):
             return 0
 
+    def _estimated_timeline(self, path: Path) -> dict[str, Any]:
+        """Fast, safe fallback when packet indexing cannot be completed."""
+        probe = self.probe(path)
+        video = next((item for item in probe.get("streams", []) if item.get("codec_type") == "video"), {})
+        rate_text = str(video.get("r_frame_rate") or "25/1")
+        try:
+            fps = float(Fraction(rate_text))
+        except (ValueError, ZeroDivisionError):
+            fps = 25.0
+        if not math.isfinite(fps) or fps <= 0:
+            fps = 25.0
+        duration = max(0.001, float(probe.get("duration") or 0.001))
+        return {"mode": "estimated", "fps": fps, "duration": duration}
+
     def _stream_timeline(
         self, path: Path, progress: Callable[[str], None] | None = None
     ) -> dict[str, Any]:
@@ -375,38 +389,51 @@ class MediaTools:
                 pass
             if progress:
                 progress("scanning_timeline")
-            audio_result = self._run([
-                str(self.settings.ffprobe_path), "-v", "error", "-select_streams", "a:0",
-                "-show_packets", "-show_entries", "packet=pts_time,duration_time", "-of", "json", resolved,
-            ], timeout=180)
-            video_result = self._run([
-                str(self.settings.ffprobe_path), "-v", "error", "-select_streams", "v:0",
-                "-show_frames", "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", resolved,
-            ], timeout=180)
-            audio_packets = json.loads(audio_result.stdout).get("packets", [])
-            video_frames = json.loads(video_result.stdout).get("frames", [])
-            audio_starts: list[float] = []
-            audio_pts: list[float] = []
-            audio_durations: list[float] = []
-            elapsed = 0.0
-            for packet in audio_packets:
-                if packet.get("pts_time") is None:
-                    continue
-                duration = float(packet.get("duration_time") or (1024 / 48000))
-                audio_starts.append(elapsed)
-                audio_pts.append(float(packet["pts_time"]))
-                audio_durations.append(duration)
-                elapsed += duration
-            frame_pts = [
-                float(frame["best_effort_timestamp_time"])
-                for frame in video_frames if frame.get("best_effort_timestamp_time") is not None
-            ]
-            if not audio_starts or not frame_pts:
-                raise MediaError("无法建立录像音画时间轴")
-            timeline = {
-                "audio_starts": audio_starts, "audio_pts": audio_pts,
-                "audio_durations": audio_durations, "video_pts": frame_pts,
-            }
+            try:
+                # Packet demuxing is dramatically faster than decoding every
+                # video frame with -show_frames. One pass also avoids two GPU
+                # workers independently hammering the same ten-minute TS file.
+                packet_result = self._run([
+                    str(self.settings.ffprobe_path), "-v", "error", "-show_packets", "-show_streams",
+                    "-show_entries", "stream=index,codec_type:packet=stream_index,pts_time,dts_time,duration_time",
+                    "-of", "json", resolved,
+                ], timeout=120)
+                packet_data = json.loads(packet_result.stdout)
+                streams = packet_data.get("streams", [])
+                audio_indexes = {int(item["index"]) for item in streams if item.get("codec_type") == "audio"}
+                video_indexes = {int(item["index"]) for item in streams if item.get("codec_type") == "video"}
+                audio_starts: list[float] = []
+                audio_pts: list[float] = []
+                audio_durations: list[float] = []
+                video_pts: list[float] = []
+                elapsed = 0.0
+                for packet in packet_data.get("packets", []):
+                    stream_index = int(packet.get("stream_index", -1))
+                    pts_text = packet.get("pts_time") or packet.get("dts_time")
+                    if pts_text is None:
+                        continue
+                    if stream_index in audio_indexes:
+                        duration = float(packet.get("duration_time") or (1024 / 48000))
+                        audio_starts.append(elapsed)
+                        audio_pts.append(float(pts_text))
+                        audio_durations.append(duration)
+                        elapsed += duration
+                    elif stream_index in video_indexes:
+                        video_pts.append(float(pts_text))
+                video_pts.sort()
+                if not audio_starts or not video_pts:
+                    raise MediaError("录像缺少可用的音频包或视频包")
+                timeline = {
+                    "mode": "packets", "audio_starts": audio_starts, "audio_pts": audio_pts,
+                    "audio_durations": audio_durations, "video_pts": video_pts,
+                }
+            except (subprocess.TimeoutExpired, MediaError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                # Do not discard a candidate merely because a damaged or slow
+                # TS index cannot be fully enumerated. Constant-rate estimation
+                # remains accurate enough for the recorder's normal H.264 TS.
+                timeline = self._estimated_timeline(path)
+                if progress:
+                    progress("timeline_fallback")
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             try:
@@ -427,6 +454,10 @@ class MediaTools:
         progress: Callable[[str], None] | None = None,
     ) -> int:
         timeline = self._stream_timeline(path, progress)
+        if timeline.get("mode") == "estimated":
+            fps = max(1.0, float(timeline.get("fps") or 25.0))
+            duration = max(0.0, float(timeline.get("duration") or decoded_audio_seconds))
+            return max(0, round(min(decoded_audio_seconds, duration) * fps))
         starts = timeline["audio_starts"]
         packet_index = max(0, min(len(starts) - 1, bisect_right(starts, decoded_audio_seconds) - 1))
         within_packet = max(0.0, decoded_audio_seconds - starts[packet_index])
