@@ -80,12 +80,23 @@ def github_update_status() -> dict[str, Any]:
             available = str(release.get("tag_name") or "").strip().lstrip("vV")
             release_url = str(release.get("html_url") or release_url)
         except httpx.HTTPError:
-            response = httpx.get(
+            last_error: Exception | None = None
+            for version_url in (
                 f"https://raw.githubusercontent.com/{repository}/main/payload/VERSION",
-                headers={"User-Agent": "Live-Highlight-Web-Updater"}, timeout=20, follow_redirects=True,
-            )
-            response.raise_for_status()
-            available = response.text.strip().lstrip("vV")
+                f"https://cdn.jsdelivr.net/gh/{repository}@main/payload/VERSION",
+            ):
+                try:
+                    response = httpx.get(
+                        version_url, headers={"User-Agent": "Live-Highlight-Web-Updater"},
+                        timeout=20, follow_redirects=True,
+                    )
+                    response.raise_for_status()
+                    available = response.text.strip().lstrip("vV")
+                    break
+                except httpx.HTTPError as exc:
+                    last_error = exc
+            else:
+                raise httpx.RequestError(f"GitHub 与 CDN 更新线路均不可用：{last_error}")
         current = current_app_version()
         return {
             "ok": True,

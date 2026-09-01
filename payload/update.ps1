@@ -91,22 +91,32 @@ if (Test-Path -LiteralPath $PidFile) {
 
 $Headers = @{ 'Accept'='application/vnd.github+json'; 'User-Agent'='Live-Highlight-Updater'; 'X-GitHub-Api-Version'='2022-11-28' }
 $ReleaseUri = "https://api.github.com/repos/$Repository/releases/latest"
+$AssetUris = @()
 try {
     $Release = Invoke-RestMethod -Uri $ReleaseUri -Headers $Headers -Method Get -TimeoutSec 30
     $AvailableText = ([string]$Release.tag_name).TrimStart('v','V')
     $Asset = @($Release.assets) | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if ($null -eq $Asset) { throw "最新版本没有找到更新包 $AssetName。" }
-    $AssetUri = [string]$Asset.browser_download_url
+    $AssetUris = @([string]$Asset.browser_download_url)
 }
 catch {
     Write-Host "GitHub API 暂时不可用，正在切换公开直链备用线路……" -ForegroundColor Yellow
     $RawVersionUri = "https://raw.githubusercontent.com/$Repository/main/payload/VERSION"
     try {
         $AvailableText = ([string](Invoke-RestMethod -Uri $RawVersionUri -Headers @{ 'User-Agent'='Live-Highlight-Updater' } -Method Get -TimeoutSec 30)).Trim().TrimStart('v','V')
-        $AssetUri = "https://github.com/$Repository/releases/latest/download/$AssetName"
+        $AssetUris = @("https://github.com/$Repository/releases/latest/download/$AssetName")
     }
-    catch { throw "GitHub API 和公开备用线路均无法访问。请稍后重试或使用离线更新补丁。$($_.Exception.Message)" }
+    catch {
+        Write-Host "GitHub 公开直链也不可用，正在切换 jsDelivr CDN……" -ForegroundColor Yellow
+        $CdnVersionUri = "https://cdn.jsdelivr.net/gh/${Repository}@main/payload/VERSION"
+        try {
+            $AvailableText = ([string](Invoke-RestMethod -Uri $CdnVersionUri -Headers @{ 'User-Agent'='Live-Highlight-Updater' } -Method Get -TimeoutSec 30)).Trim().TrimStart('v','V')
+        }
+        catch { throw "GitHub 与 CDN 更新线路均无法访问。请使用离线更新补丁。$($_.Exception.Message)" }
+    }
 }
+$CdnAssetUri = "https://cdn.jsdelivr.net/gh/${Repository}@v${AvailableText}/dist/$AssetName"
+if ($AssetUris -notcontains $CdnAssetUri) { $AssetUris += $CdnAssetUri }
 Write-Host "可用版本：$AvailableText" -ForegroundColor Cyan
 if ((Convert-Version $AvailableText) -le (Convert-Version $CurrentText)) {
     Write-Host "当前已经是最新版本，无需更新。" -ForegroundColor Green
@@ -127,7 +137,22 @@ Assert-UnderRoot $WorkDir $UpdateRoot
 
 try {
     Write-Host "正在下载更新包……"
-    Invoke-WebRequest -Uri $AssetUri -Headers @{ 'User-Agent'='Live-Highlight-Updater' } -OutFile $ArchiveFile -UseBasicParsing -TimeoutSec 180
+    $DownloadError = $null
+    foreach ($AssetUri in $AssetUris) {
+        try {
+            if (Test-Path -LiteralPath $ArchiveFile) { Remove-Item -LiteralPath $ArchiveFile -Force }
+            Invoke-WebRequest -Uri $AssetUri -Headers @{ 'User-Agent'='Live-Highlight-Updater' } -OutFile $ArchiveFile -UseBasicParsing -TimeoutSec 180
+            $DownloadError = $null
+            break
+        }
+        catch {
+            $DownloadError = $_.Exception
+            Write-Host "当前下载线路失败，正在尝试下一条……" -ForegroundColor Yellow
+        }
+    }
+    if ($null -ne $DownloadError -or -not (Test-Path -LiteralPath $ArchiveFile)) {
+        throw "所有在线下载线路均失败，请使用离线更新补丁。$($DownloadError.Message)"
+    }
     Expand-Archive -LiteralPath $ArchiveFile -DestinationPath $ExtractDir -Force
     $ManifestFile = Join-Path $ExtractDir 'update-manifest.json'
     $PayloadRoot = Join-Path $ExtractDir 'payload'

@@ -19,7 +19,8 @@
 *.mkv
 *.mov
 *.zip
+!dist/
+!dist/live-highlight-update.zip
 *.log
 __pycache__/
 *.pyc
-

@@ -22,4 +22,27 @@ foreach ($Name in $RootFiles) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "缺少发布文件：$Source" }
     Copy-Item -LiteralPath $Source -Destination (Join-Path $PayloadRoot $Name) -Force
 }
+$DistRoot = Join-Path $RepoRoot "dist"
+New-Item -ItemType Directory -Path $DistRoot -Force | Out-Null
+$ManifestFile = Join-Path $RepoRoot "update-manifest.local.json"
+$PackageFile = Join-Path $DistRoot "live-highlight-update.zip"
+$Files = Get-ChildItem -LiteralPath $PayloadRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
+    $Relative = [IO.Path]::GetRelativePath($PayloadRoot, $_.FullName).Replace('\','/')
+    [ordered]@{ path=$Relative; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+}
+[ordered]@{ version=(Get-Content -LiteralPath (Join-Path $PayloadRoot 'VERSION') -Raw).Trim(); files=@($Files) } |
+    ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ManifestFile -Encoding UTF8
+if (Test-Path -LiteralPath $PackageFile) { Remove-Item -LiteralPath $PackageFile -Force }
+$StageRoot = Join-Path $RepoRoot "_package_stage"
+if (Test-Path -LiteralPath $StageRoot) { Remove-Item -LiteralPath $StageRoot -Recurse -Force }
+New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
+try {
+    Copy-Item -LiteralPath $PayloadRoot -Destination (Join-Path $StageRoot 'payload') -Recurse -Force
+    Copy-Item -LiteralPath $ManifestFile -Destination (Join-Path $StageRoot 'update-manifest.json') -Force
+    Compress-Archive -Path (Join-Path $StageRoot 'payload'),(Join-Path $StageRoot 'update-manifest.json') -DestinationPath $PackageFile -CompressionLevel Optimal
+}
+finally {
+    Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ManifestFile -Force -ErrorAction SilentlyContinue
+}
 Write-Host "已同步安全更新载荷到 $PayloadRoot" -ForegroundColor Green
