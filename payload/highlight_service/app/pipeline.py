@@ -270,33 +270,23 @@ class HighlightPipeline:
         self.media = MediaTools(settings)
         self.rooms = RoomRegistry(settings, db)
         self.transcriber = WhisperTranscriber(settings)
-        primary_settings = [settings]
-        if settings.ai_secondary_api_key and settings.ai_secondary_model:
-            primary_settings.append(replace(
-                settings,
-                ai_api_key=settings.ai_secondary_api_key,
-                ai_model=settings.ai_secondary_model,
-                ai_vision_enabled=False,
-            ))
-        self.primary_analyzers = [
-            CandidateAnalyzer(item, analysis_label=item.ai_model)
-            for item in primary_settings if item.ai_api_key and item.ai_model
-        ]
-        # Keep the historical attribute for health checks, vision and scripts.
-        self.analyzer = self.primary_analyzers[0] if self.primary_analyzers else CandidateAnalyzer(settings)
-        self.fallback_analyzer: CandidateAnalyzer | None = None
-        if settings.ai_fallback_api_key and settings.ai_fallback_model:
-            fallback_settings = replace(
-                settings,
-                ai_api_key=settings.ai_fallback_api_key,
-                ai_model=settings.ai_fallback_model,
-                ai_vision_enabled=False,
-            )
-            self.fallback_analyzer = CandidateAnalyzer(
-                fallback_settings, analysis_label=settings.ai_fallback_model
-            )
-        self.supplement_analyzer: CandidateAnalyzer | None = None
-        if settings.deepseek_supplement_enabled and settings.deepseek_api_key:
+        plus_key = settings.relay_plus_api_key or settings.ai_api_key
+        plus_model = settings.relay_plus_model if settings.relay_plus_api_key else settings.ai_model
+        pro_key = settings.relay_pro_api_key or settings.ai_secondary_api_key
+        pro_model = settings.relay_pro_model if settings.relay_pro_api_key else settings.ai_secondary_model
+        route_specs: list[tuple[str, str, Settings]] = []
+        if plus_key and plus_model:
+            route_specs.append(("relay_plus", "中转站 Plus", replace(
+                settings, ai_api_key=plus_key, ai_model=plus_model, ai_vision_enabled=False,
+                ai_max_attempts=1,
+            )))
+        if pro_key and pro_model:
+            route_specs.append(("relay_pro", "中转站 Pro", replace(
+                settings, ai_api_key=pro_key, ai_model=pro_model, ai_vision_enabled=False,
+                ai_max_attempts=1,
+            )))
+        deepseek_settings: Settings | None = None
+        if settings.deepseek_api_key and settings.deepseek_model:
             deepseek_settings = replace(
                 settings,
                 ai_base_url=settings.deepseek_base_url,
@@ -305,11 +295,30 @@ class HighlightPipeline:
                 ai_protocol="chat",
                 ai_thinking_mode="disabled",
                 ai_max_output_tokens=8000,
+                ai_max_attempts=1,
                 ai_vision_enabled=False,
             )
-            self.supplement_analyzer = CandidateAnalyzer(
-                deepseek_settings, analysis_label=settings.deepseek_model
+            route_specs.append(("deepseek_official", "DeepSeek 官方", deepseek_settings))
+        self.primary_analyzers = []
+        for route_id, route_label, route_settings in route_specs:
+            analyzer = CandidateAnalyzer(
+                route_settings, analysis_label=f"primary-{route_id}-{route_settings.ai_model}"
             )
+            analyzer.route_id = route_id
+            analyzer.route_label = route_label
+            self.primary_analyzers.append(analyzer)
+        # Keep the historical attribute for health checks, vision and scripts.
+        self.analyzer = self.primary_analyzers[0] if self.primary_analyzers else CandidateAnalyzer(settings)
+        # The old mini fallback is intentionally retired: the official
+        # DeepSeek route is both more independent and a full primary lane.
+        self.fallback_analyzer: CandidateAnalyzer | None = None
+        self.supplement_analyzer: CandidateAnalyzer | None = None
+        if settings.deepseek_supplement_enabled and deepseek_settings:
+            self.supplement_analyzer = CandidateAnalyzer(
+                deepseek_settings, analysis_label=f"supplement-{settings.deepseek_model}"
+            )
+            self.supplement_analyzer.route_id = "deepseek_official"
+            self.supplement_analyzer.route_label = "DeepSeek 官方补漏"
         self.recorder = RecorderSupervisor(settings, db)
         self.live_monitor = LiveStatusMonitor(settings, db)
         self.queue: queue.Queue[Path | None] = queue.Queue()
@@ -317,21 +326,21 @@ class HighlightPipeline:
         self._stage_stop = threading.Event()
         self._ai_claim_lock = threading.Lock()
         self._ai_state_lock = threading.Lock()
-        self._ai_model_locks = {
-            analyzer.analysis_version: threading.Lock()
-            for analyzer in [
-                *self.primary_analyzers,
-                *([self.fallback_analyzer] if self.fallback_analyzer else []),
-                *([self.supplement_analyzer] if self.supplement_analyzer else []),
-            ]
-        }
+        route_locks: dict[str, threading.Lock] = {}
+        self._ai_model_locks: dict[str, threading.Lock] = {}
+        for analyzer in [
+            *self.primary_analyzers,
+            *([self.supplement_analyzer] if self.supplement_analyzer else []),
+        ]:
+            route_id = str(getattr(analyzer, "route_id", analyzer.analysis_version))
+            self._ai_model_locks[analyzer.analysis_version] = route_locks.setdefault(
+                route_id, threading.Lock()
+            )
         self._render_claim_lock = threading.Lock()
         self._last_room: dict[str, int | None] = {"asr": None, "ai": None, "render": None}
         self._worker = threading.Thread(target=self._work, name="segment-discovery", daemon=True)
         self._asr_worker = threading.Thread(target=self._asr_loop, name="asr-worker-1", daemon=True)
-        ai_worker_count = min(
-            max(1, int(settings.ai_worker_count)), max(1, len(self.primary_analyzers))
-        )
+        ai_worker_count = max(1, len(self.primary_analyzers))
         self._ai_workers = [
             threading.Thread(target=self._ai_loop, args=(index,), name=f"ai-worker-{index + 1}", daemon=True)
             for index in range(ai_worker_count)
@@ -344,8 +353,25 @@ class HighlightPipeline:
 
     def ai_route_status(self) -> dict[str, Any]:
         primary = [item.settings.ai_model for item in self.primary_analyzers]
-        fallback = self.fallback_analyzer.settings.ai_model if self.fallback_analyzer else ""
-        circuit = self._provider_circuit_status(self.settings.ai_base_url)
+        routes = []
+        for analyzer in self.primary_analyzers:
+            route_id = self._route_key(analyzer)
+            circuit = self._provider_circuit_status(route_id)
+            routes.append({
+                "id": route_id,
+                "label": str(getattr(analyzer, "route_label", analyzer.settings.ai_model)),
+                "model": analyzer.settings.ai_model,
+                **circuit,
+            })
+        usable = [item for item in routes if not item["open"] and item["model"] not in item["disabled_models"]]
+        blocked = bool(routes) and not usable
+        longest = max(routes, key=lambda item: int(item["remaining_seconds"]), default={})
+        route_summary = " · ".join(
+            f"{item['label']} {item['model']}（"
+            + (f"保护{max(1, int(item['remaining_seconds']) // 60)}分钟" if item["open"] else "正常")
+            + "）"
+            for item in routes
+        ) if routes else "未配置"
         delayed = self.db.one(
             "SELECT COUNT(*) AS count FROM recording_segments WHERE status='ai_waiting' AND ai_next_retry_at>?",
             (utc_now(),),
@@ -355,21 +381,36 @@ class HighlightPipeline:
         ) or {"count": 0}
         return {
             "primary_models": primary,
-            "fallback_model": fallback,
+            "fallback_model": "",
             "worker_count": len(self._ai_workers),
-            "label": " + ".join(primary) if primary else "未配置",
-            "circuit_open": circuit["open"],
-            "circuit_open_until": circuit["open_until"],
-            "circuit_remaining_seconds": circuit["remaining_seconds"],
-            "last_error": circuit["last_error"],
+            "label": " + ".join(
+                f"{item['label']} {item['model']}" for item in routes
+            ) if routes else "未配置",
+            "route_summary": route_summary,
+            "routes": routes,
+            "circuit_open": blocked,
+            "circuit_open_until": str(longest.get("open_until") or ""),
+            "circuit_remaining_seconds": int(longest.get("remaining_seconds") or 0),
+            "last_error": str(longest.get("last_error") or ""),
             "delayed_count": int(delayed["count"]),
             "paused_count": int(paused["count"]),
-            "disabled_models": circuit["disabled_models"],
+            "disabled_models": sorted({
+                model for item in routes for model in item["disabled_models"]
+            }),
         }
 
     @staticmethod
     def _provider_key(base_url: str) -> str:
         return str(base_url or "unconfigured").strip().rstrip("/").lower()
+
+    @staticmethod
+    def _route_key(analyzer: CandidateAnalyzer) -> str:
+        settings_obj = getattr(analyzer, "settings", None)
+        return str(
+            getattr(analyzer, "route_id", "")
+            or getattr(settings_obj, "ai_base_url", "")
+            or "local_analyzer"
+        )
 
     @staticmethod
     def _parse_utc(value: str) -> datetime | None:
@@ -381,8 +422,8 @@ class HighlightPipeline:
         except ValueError:
             return None
 
-    def _provider_circuit_status(self, base_url: str) -> dict[str, Any]:
-        row = self.db.one("SELECT * FROM ai_provider_state WHERE provider_key=?", (self._provider_key(base_url),)) or {}
+    def _provider_circuit_status(self, provider_key: str) -> dict[str, Any]:
+        row = self.db.one("SELECT * FROM ai_provider_state WHERE provider_key=?", (self._provider_key(provider_key),)) or {}
         until = self._parse_utc(str(row.get("circuit_open_until") or ""))
         remaining = max(0, int((until - datetime.now(timezone.utc)).total_seconds())) if until else 0
         try:
@@ -416,11 +457,11 @@ class HighlightPipeline:
             return "invalid_response"
         return "temporary"
 
-    def _record_provider_failure(self, base_url: str, model: str, message: str) -> str:
+    def _record_provider_failure(self, provider_key: str, model: str, message: str) -> str:
         category = self._classify_ai_failure(message)
-        key = self._provider_key(base_url)
+        key = self._provider_key(provider_key)
         with self._ai_state_lock:
-            state = self._provider_circuit_status(base_url)
+            state = self._provider_circuit_status(provider_key)
             disabled = list(state["disabled_models"])
             failures = state["consecutive_failures"]
             open_until = state["open_until"]
@@ -449,10 +490,10 @@ class HighlightPipeline:
             )
         return category
 
-    def _record_provider_success(self, base_url: str) -> None:
-        key = self._provider_key(base_url)
+    def _record_provider_success(self, provider_key: str) -> None:
+        key = self._provider_key(provider_key)
         with self._ai_state_lock:
-            state = self._provider_circuit_status(base_url)
+            state = self._provider_circuit_status(provider_key)
             now = utc_now()
             self.db.execute(
                 """INSERT INTO ai_provider_state
@@ -625,13 +666,14 @@ class HighlightPipeline:
         )
 
     def reset_ai_circuit(self, clear_disabled: bool = False) -> None:
-        key = self._provider_key(self.settings.ai_base_url)
         disabled_sql = ",disabled_models_json='[]'" if clear_disabled else ""
-        self.db.execute(
-            f"""UPDATE ai_provider_state SET consecutive_failures=0,circuit_open_until='',
-               last_error='',updated_at=?{disabled_sql} WHERE provider_key=?""",
-            (utc_now(), key),
-        )
+        keys = [self._provider_key(self._route_key(item)) for item in self.primary_analyzers]
+        for key in keys:
+            self.db.execute(
+                f"""UPDATE ai_provider_state SET consecutive_failures=0,circuit_open_until='',
+                   last_error='',updated_at=?{disabled_sql} WHERE provider_key=?""",
+                (utc_now(), key),
+            )
 
     def _work(self) -> None:
         while True:
@@ -811,14 +853,17 @@ class HighlightPipeline:
     def _primary_lane_for_segment(self, segment_id: int) -> int:
         if len(self.primary_analyzers) <= 1:
             return 0
-        # Stable 60/40 split: GPT-5.5 receives three out of every five
-        # segments, GPT-5.4 receives the other two. A retry or restart keeps
-        # the same preferred model for the segment.
-        return 0 if segment_id % 5 in {0, 1, 2} else 1
+        # Stable equal distribution. Retries and restarts retain the same
+        # preferred route, while failover may finish on another healthy route.
+        return (segment_id - 1) % len(self.primary_analyzers)
 
     def _next_fair_ai_segment(self, lane_index: int) -> dict[str, Any] | None:
         with self._ai_claim_lock:
-            if self._provider_circuit_status(self.settings.ai_base_url)["open"]:
+            route_states = [
+                self._provider_circuit_status(self._route_key(item))
+                for item in self.primary_analyzers
+            ]
+            if route_states and all(state["open"] for state in route_states):
                 return None
             now = utc_now()
             rows = self.db.all(
@@ -944,19 +989,25 @@ class HighlightPipeline:
         segment_id = int(segment["id"])
         current = self.db.one("SELECT * FROM recording_segments WHERE id=?", (segment_id,)) or segment
         gpt_done = self._completed_window_keys(current, "gpt_windows_done_json")
+        deepseek_done = self._completed_window_keys(current, "deepseek_windows_done_json")
         preferred_lane = self._primary_lane_for_segment(segment_id) if lane_index is None else lane_index
         for since, until in windows:
             window_key = self._window_key(since, until)
             if window_key in gpt_done:
                 continue
             self.db.update_segment_status(segment_id, "gpt_analyzing")
-            self._analyze_window_with_failover(segment, since, until, preferred_lane)
+            selected = self._analyze_window_with_failover(segment, since, until, preferred_lane)
             self._mark_window_complete(segment_id, "gpt_windows_done_json", window_key)
             gpt_done.add(window_key)
+            if self._route_key(selected) == "deepseek_official":
+                # Official DeepSeek already performed the primary selection;
+                # it must not pay for and duplicate its own supplement pass.
+                self._mark_window_complete(segment_id, "deepseek_windows_done_json", window_key)
+                deepseek_done.add(window_key)
 
         if self.supplement_analyzer:
             current = self.db.one("SELECT * FROM recording_segments WHERE id=?", (segment_id,)) or segment
-            deepseek_done = self._completed_window_keys(current, "deepseek_windows_done_json")
+            deepseek_done |= self._completed_window_keys(current, "deepseek_windows_done_json")
             excluded_ranges = self._candidate_ranges(segment["session_id"], primary_only=True)
             for since, until in windows:
                 window_key = self._window_key(since, until)
@@ -1061,22 +1112,17 @@ class HighlightPipeline:
         available = self.primary_analyzers or [self.analyzer]
         ordered = [available[preferred_lane % len(available)]]
         ordered.extend(item for item in available if item is not ordered[0])
-        if self.fallback_analyzer:
-            ordered.append(self.fallback_analyzer)
         errors: list[str] = []
-        initial_provider_state = self._provider_circuit_status(
-            str(getattr(getattr(ordered[0], "settings", None), "ai_base_url", ""))
-        )
-        if initial_provider_state["open"]:
-            raise AIUnavailable(
-                f"中转站连接已暂停保护，约 {max(1, initial_provider_state['remaining_seconds'] // 60)} 分钟后自动恢复"
-            )
         for index, analyzer in enumerate(ordered):
             model_name = getattr(getattr(analyzer, "settings", None), "ai_model", "GPT 主模型")
-            base_url = str(getattr(getattr(analyzer, "settings", None), "ai_base_url", ""))
-            provider_state = self._provider_circuit_status(base_url)
+            route_key = self._route_key(analyzer)
+            route_label = str(getattr(analyzer, "route_label", model_name))
+            provider_state = self._provider_circuit_status(route_key)
+            if provider_state["open"]:
+                errors.append(f"{route_label}: 暂停保护中")
+                continue
             if model_name in provider_state["disabled_models"]:
-                errors.append(f"{model_name}: 当前中转站分组不支持，已自动停用")
+                errors.append(f"{route_label} {model_name}: 当前线路不支持，已自动停用")
                 continue
             try:
                 lock = self._ai_model_locks.setdefault(analyzer.analysis_version, threading.Lock())
@@ -1084,32 +1130,31 @@ class HighlightPipeline:
                     self._analyze_window(
                         segment, since, until, analyzer, primary_request=True
                     )
-                self._record_provider_success(base_url)
+                self._record_provider_success(route_key)
                 if index:
                     self.db.event(
                         "warning", "ai_failover",
-                        f"主线路暂时不可用，已由 {model_name} 接续完成",
-                        {"segment_id": segment["id"], "model": model_name},
+                        f"首选线路暂时不可用，已由 {route_label} {model_name} 接续完成",
+                        {"segment_id": segment["id"], "model": model_name, "route": route_key},
                     )
                 return analyzer
             except AIUnavailable as exc:
                 errors.append(f"{model_name}: {exc}")
-                category = self._record_provider_failure(base_url, model_name, str(exc))
+                category = self._record_provider_failure(route_key, model_name, str(exc))
                 self.db.event(
                     "warning", "ai_route_failed",
-                    f"{model_name} 线路失败：{exc}",
-                    {"segment_id": segment["id"], "model": model_name, "category": category},
+                    f"{route_label} {model_name} 线路失败：{exc}",
+                    {"segment_id": segment["id"], "model": model_name, "route": route_key, "category": category},
                 )
-                # The primary routes share the same relay. A TLS/network/auth
-                # failure therefore affects every model on that relay; trying
-                # all of them only repeats paid work and amplifies an outage.
-                if category in {"transport", "auth", "rate_limit"}:
-                    raise AIUnavailable(f"{model_name}: {exc}") from exc
+                # Each subscription group and the official provider owns an
+                # independent circuit. A broken relay route therefore hands
+                # this unpaid/unfinished window to the next healthy provider.
+                continue
         raise AIUnavailable("；".join(errors))
 
     @staticmethod
     def _is_supplement_analysis(analysis_version: str) -> bool:
-        return "deepseek" in str(analysis_version).lower()
+        return "supplement-" in str(analysis_version).lower()
 
     def _candidate_ranges(
         self, session_id: str, analysis_version: str = "", primary_only: bool = False,

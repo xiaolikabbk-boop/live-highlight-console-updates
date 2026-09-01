@@ -67,7 +67,13 @@ class Settings:
     ai_secondary_model: str = "gpt-5.4"
     ai_fallback_api_key: str = ""
     ai_fallback_model: str = "gpt-5.4-mini"
-    ai_worker_count: int = 2
+    # Explicit route names keep the two relay subscription groups separate.
+    # The legacy AI_* fields above remain supported for in-place upgrades.
+    relay_plus_api_key: str = ""
+    relay_plus_model: str = "gpt-5.6-terra"
+    relay_pro_api_key: str = ""
+    relay_pro_model: str = "gpt-5.5"
+    ai_worker_count: int = 3
     ai_protocol: str = "auto"
     ai_timeout_seconds: int = 120
     ai_max_attempts: int = 3
@@ -119,6 +125,10 @@ class Settings:
             "HIGHLIGHT_AI_SECONDARY_MODEL": "ai_secondary_model",
             "HIGHLIGHT_AI_FALLBACK_API_KEY": "ai_fallback_api_key",
             "HIGHLIGHT_AI_FALLBACK_MODEL": "ai_fallback_model",
+            "HIGHLIGHT_RELAY_PLUS_API_KEY": "relay_plus_api_key",
+            "HIGHLIGHT_RELAY_PLUS_MODEL": "relay_plus_model",
+            "HIGHLIGHT_RELAY_PRO_API_KEY": "relay_pro_api_key",
+            "HIGHLIGHT_RELAY_PRO_MODEL": "relay_pro_model",
             "HIGHLIGHT_AI_WORKER_COUNT": "ai_worker_count",
             "HIGHLIGHT_AI_PROTOCOL": "ai_protocol",
             "HIGHLIGHT_AI_VISION_ENABLED": "ai_vision_enabled",
@@ -160,6 +170,8 @@ class Settings:
         data["ai_api_key"] = "configured" if self.ai_api_key else ""
         data["ai_secondary_api_key"] = "configured" if self.ai_secondary_api_key else ""
         data["ai_fallback_api_key"] = "configured" if self.ai_fallback_api_key else ""
+        data["relay_plus_api_key"] = "configured" if self.relay_plus_api_key else ""
+        data["relay_pro_api_key"] = "configured" if self.relay_pro_api_key else ""
         data["guardian_ai_api_key"] = "configured" if self.guardian_ai_api_key else ""
         data["guardian_vision_api_key"] = "configured" if self.guardian_vision_api_key else ""
         data["deepseek_api_key"] = "configured" if self.deepseek_api_key else ""

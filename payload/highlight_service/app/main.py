@@ -176,12 +176,14 @@ def candidate_view(row: dict[str, Any]) -> dict[str, Any]:
     result["source_ranges_text"] = json.dumps(result["source_ranges"], ensure_ascii=False)
     result["caption_text"] = "\n".join(item.get("text", "") for item in result["captions"])
     analysis_version = str(result.get("analysis_version") or "").lower()
-    if "deepseek" in analysis_version:
+    if "supplement-" in analysis_version:
         result["model_role"] = "DeepSeek 补漏"
-    elif "gpt-5.4-mini" in analysis_version:
-        result["model_role"] = "GPT-5.4-mini 备用主选"
-    elif "gpt-5.4" in analysis_version:
-        result["model_role"] = "GPT-5.4 主选"
+    elif "deepseek" in analysis_version:
+        result["model_role"] = "DeepSeek 官方主选"
+    elif "relay_plus" in analysis_version:
+        result["model_role"] = "中转站 Plus 主选"
+    elif "relay_pro" in analysis_version:
+        result["model_role"] = "中转站 Pro 主选"
     else:
         result["model_role"] = "GPT-5.5 主选"
     try:
@@ -673,8 +675,8 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
         if spec["key"] == "ai" and ai_routes.get("circuit_open"):
             remaining = int(ai_routes.get("circuit_remaining_seconds") or 0)
             item.update(
-                state="stalled", state_label="中转站保护中",
-                current="检测到连续连接故障，已暂停所有模型请求，防止重复计费",
+                state="stalled", state_label="全部线路保护中",
+                current="三条主力线路当前都不可用，已暂停请求以防重复计费",
                 elapsed=f"{_elapsed_text(remaining)}后重试",
                 hint=str(ai_routes.get("last_error") or "等待中转站连接恢复")[:240],
             )
@@ -709,14 +711,14 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             elif spec["key"] == "ai":
                 descriptions = []
                 for job in spec.get("active_items", []):
-                    stage = "DeepSeek 补漏" if job.get("status") == "deepseek_analyzing" else "GPT 主选"
+                    stage = "DeepSeek 补漏" if job.get("status") == "deepseek_analyzing" else "多模型主选"
                     room = " · ".join(part for part in (
                         str(job.get("sequence") or ""), str(job.get("room_name") or job.get("source_id") or "")
                     ) if part)
                     descriptions.append(f"#{job['id']} {room} · {stage}")
                 item["current"] = "；".join(descriptions)
                 fallback = f"；备用 {ai_routes['fallback_model']}" if ai_routes["fallback_model"] else ""
-                item["hint"] = f"主线路 {ai_routes['label']}{fallback}；失败会自动换线并保留任务"
+                item["hint"] = f"{ai_routes['route_summary']}{fallback}；单线失败会自动换线并保留任务"
             item["elapsed"] = _elapsed_text(elapsed)
             if elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能卡住", hint="单项运行时间明显过长，建议查看任务管理器或错误日志")
@@ -1062,13 +1064,15 @@ def open_model_key_config() -> dict[str, Any]:
     }
     defaults = [
         ("HIGHLIGHT_AI_BASE_URL", "https://api.sisct2.xyz/v1"),
-        ("HIGHLIGHT_AI_API_KEY", ""),
-        ("HIGHLIGHT_AI_MODEL", "gpt-5.5"),
-        ("HIGHLIGHT_AI_SECONDARY_API_KEY", ""),
-        ("HIGHLIGHT_AI_SECONDARY_MODEL", "gpt-5.4"),
-        ("HIGHLIGHT_AI_FALLBACK_API_KEY", ""),
-        ("HIGHLIGHT_AI_FALLBACK_MODEL", "gpt-5.4-mini"),
-        ("HIGHLIGHT_AI_WORKER_COUNT", "2"),
+        ("HIGHLIGHT_RELAY_PLUS_API_KEY", ""),
+        ("HIGHLIGHT_RELAY_PLUS_MODEL", "gpt-5.6-terra"),
+        ("HIGHLIGHT_RELAY_PRO_API_KEY", ""),
+        ("HIGHLIGHT_RELAY_PRO_MODEL", "gpt-5.5"),
+        ("HIGHLIGHT_DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        ("HIGHLIGHT_DEEPSEEK_API_KEY", ""),
+        ("HIGHLIGHT_DEEPSEEK_MODEL", "deepseek-v4-pro"),
+        ("HIGHLIGHT_DEEPSEEK_SUPPLEMENT_ENABLED", "true"),
+        ("HIGHLIGHT_AI_WORKER_COUNT", "3"),
         ("HIGHLIGHT_GUARDIAN_AI_BASE_URL", "https://api.sisct2.xyz/v1"),
         ("HIGHLIGHT_GUARDIAN_AI_API_KEY", ""),
         ("HIGHLIGHT_GUARDIAN_AI_MODEL", "gpt-5.5"),
@@ -1079,7 +1083,12 @@ def open_model_key_config() -> dict[str, Any]:
     missing = [(key, value) for key, value in defaults if key not in present]
     if missing:
         prefix = "\n" if existing and not existing.endswith("\n") else ""
-        addition = prefix + "\n# GPT 多模型并行与自动备用线路\n" + "".join(
+        addition = prefix + (
+            "\n# ===== 三条主力模型线路（请按备注分别填写） =====\n"
+            "# Plus 组：gpt-5.6-terra 主力；填 Plus 分组生成的密钥\n"
+            "# Pro 组：gpt-5.5 主力；填 Pro 分组生成的密钥\n"
+            "# DeepSeek 官方：第三主力，同时只为中转站产出做补漏\n"
+        ) + "".join(
             f"{key}={value}\n" for key, value in missing
         )
         env_path.parent.mkdir(parents=True, exist_ok=True)

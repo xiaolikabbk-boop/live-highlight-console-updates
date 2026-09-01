@@ -90,7 +90,13 @@ class Guardian:
         if any(word in text for word in ("异常", "故障", "卡住", "为什么", "诊断")):
             problems: list[str] = []
             if routes.get("circuit_open"):
-                problems.append(f"中转站已进入保护暂停，约 {max(1, int(routes['circuit_remaining_seconds']) // 60)} 分钟后恢复")
+                problems.append(f"三条主力线路均已进入保护暂停，约 {max(1, int(routes['circuit_remaining_seconds']) // 60)} 分钟后恢复")
+            else:
+                protected = [item for item in routes.get("routes", []) if item.get("open")]
+                if protected:
+                    problems.append("部分线路暂时保护，其他主力仍在接续：" + "、".join(
+                        str(item.get("label") or item.get("model")) for item in protected
+                    ))
             if delayed:
                 problems.append(f"{delayed} 个模型任务正在延迟重试")
             if paused:
