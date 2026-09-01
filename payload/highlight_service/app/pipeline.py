@@ -9,7 +9,7 @@ import time
 import ctypes
 from ctypes import wintypes
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -316,6 +316,7 @@ class HighlightPipeline:
         self.watcher = SegmentWatcher(settings, db, self.enqueue)
         self._stage_stop = threading.Event()
         self._ai_claim_lock = threading.Lock()
+        self._ai_state_lock = threading.Lock()
         self._ai_model_locks = {
             analyzer.analysis_version: threading.Lock()
             for analyzer in [
@@ -344,12 +345,150 @@ class HighlightPipeline:
     def ai_route_status(self) -> dict[str, Any]:
         primary = [item.settings.ai_model for item in self.primary_analyzers]
         fallback = self.fallback_analyzer.settings.ai_model if self.fallback_analyzer else ""
+        circuit = self._provider_circuit_status(self.settings.ai_base_url)
+        delayed = self.db.one(
+            "SELECT COUNT(*) AS count FROM recording_segments WHERE status='ai_waiting' AND ai_next_retry_at>?",
+            (utc_now(),),
+        ) or {"count": 0}
+        paused = self.db.one(
+            "SELECT COUNT(*) AS count FROM recording_segments WHERE status IN ('ai_retry_paused','ai_abandoned')"
+        ) or {"count": 0}
         return {
             "primary_models": primary,
             "fallback_model": fallback,
             "worker_count": len(self._ai_workers),
             "label": " + ".join(primary) if primary else "未配置",
+            "circuit_open": circuit["open"],
+            "circuit_open_until": circuit["open_until"],
+            "circuit_remaining_seconds": circuit["remaining_seconds"],
+            "last_error": circuit["last_error"],
+            "delayed_count": int(delayed["count"]),
+            "paused_count": int(paused["count"]),
+            "disabled_models": circuit["disabled_models"],
         }
+
+    @staticmethod
+    def _provider_key(base_url: str) -> str:
+        return str(base_url or "unconfigured").strip().rstrip("/").lower()
+
+    @staticmethod
+    def _parse_utc(value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    def _provider_circuit_status(self, base_url: str) -> dict[str, Any]:
+        row = self.db.one("SELECT * FROM ai_provider_state WHERE provider_key=?", (self._provider_key(base_url),)) or {}
+        until = self._parse_utc(str(row.get("circuit_open_until") or ""))
+        remaining = max(0, int((until - datetime.now(timezone.utc)).total_seconds())) if until else 0
+        try:
+            disabled = json.loads(row.get("disabled_models_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            disabled = []
+        return {
+            "open": remaining > 0,
+            "open_until": str(row.get("circuit_open_until") or ""),
+            "remaining_seconds": remaining,
+            "last_error": str(row.get("last_error") or ""),
+            "consecutive_failures": int(row.get("consecutive_failures") or 0),
+            "disabled_models": [str(item) for item in disabled],
+        }
+
+    @staticmethod
+    def _classify_ai_failure(message: str) -> str:
+        lowered = str(message).lower()
+        if "model_not_found" in lowered or "not supported by any configured account" in lowered or "http 404" in lowered:
+            return "model_unavailable"
+        if any(token in lowered for token in (
+            "unexpected_eof", "bad_record_mac", "ssl:", "tls", "remoteprotocolerror",
+            "connection reset", "connection aborted", "server disconnected",
+        )):
+            return "transport"
+        if "http 401" in lowered or "http 403" in lowered or "unauthorized" in lowered:
+            return "auth"
+        if "http 429" in lowered or "rate limit" in lowered:
+            return "rate_limit"
+        if any(token in lowered for token in ("无效 json", "无法解析", "截断内容", "返回空内容")):
+            return "invalid_response"
+        return "temporary"
+
+    def _record_provider_failure(self, base_url: str, model: str, message: str) -> str:
+        category = self._classify_ai_failure(message)
+        key = self._provider_key(base_url)
+        with self._ai_state_lock:
+            state = self._provider_circuit_status(base_url)
+            disabled = list(state["disabled_models"])
+            failures = state["consecutive_failures"]
+            open_until = state["open_until"]
+            if category == "model_unavailable":
+                if model and model not in disabled:
+                    disabled.append(model)
+            elif category in {"transport", "auth", "rate_limit", "temporary"}:
+                failures += 1
+                threshold = 1 if category in {"auth", "rate_limit"} else 2
+                if failures >= threshold:
+                    delays = (300, 900, 1800, 3600)
+                    delay = delays[min(max(0, failures - threshold), len(delays) - 1)]
+                    open_until = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
+            now = utc_now()
+            self.db.execute(
+                """INSERT INTO ai_provider_state
+                   (provider_key,consecutive_failures,circuit_open_until,last_error,last_error_at,disabled_models_json,updated_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(provider_key) DO UPDATE SET
+                     consecutive_failures=excluded.consecutive_failures,
+                     circuit_open_until=excluded.circuit_open_until,last_error=excluded.last_error,
+                     last_error_at=excluded.last_error_at,disabled_models_json=excluded.disabled_models_json,
+                     updated_at=excluded.updated_at""",
+                (key, failures, open_until, str(message)[:2000], now,
+                 json.dumps(disabled, ensure_ascii=False), now),
+            )
+        return category
+
+    def _record_provider_success(self, base_url: str) -> None:
+        key = self._provider_key(base_url)
+        with self._ai_state_lock:
+            state = self._provider_circuit_status(base_url)
+            now = utc_now()
+            self.db.execute(
+                """INSERT INTO ai_provider_state
+                   (provider_key,consecutive_failures,circuit_open_until,last_error,last_error_at,disabled_models_json,updated_at)
+                   VALUES(?,0,'','', '',?,?)
+                   ON CONFLICT(provider_key) DO UPDATE SET consecutive_failures=0,
+                     circuit_open_until='',last_error='',updated_at=excluded.updated_at""",
+                (key, json.dumps(state["disabled_models"], ensure_ascii=False), now),
+            )
+
+    def _schedule_ai_retry(self, segment_id: int, message: str, stage: str = "gpt", model: str = "") -> None:
+        row = self.db.one("SELECT ai_retry_count FROM recording_segments WHERE id=?", (segment_id,)) or {}
+        retry_count = int(row.get("ai_retry_count") or 0) + 1
+        now = utc_now()
+        if retry_count >= 5:
+            self.db.execute(
+                """UPDATE recording_segments SET status='ai_retry_paused',error=?,ai_retry_count=?,
+                   ai_next_retry_at='',ai_last_failed_stage=?,ai_last_failed_model=?,updated_at=? WHERE id=?""",
+                (str(message)[:2000], retry_count, stage, model, now, segment_id),
+            )
+            self.db.event("warning", "ai_retry_paused", f"模型任务连续失败 {retry_count} 次，已暂停自动重试", {
+                "segment_id": segment_id, "retry_count": retry_count, "stage": stage, "model": model,
+            })
+            return
+        delays = (120, 300, 900, 1800)
+        delay = delays[min(retry_count - 1, len(delays) - 1)]
+        retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        self.db.execute(
+            """UPDATE recording_segments SET status='ai_waiting',error=?,ai_retry_count=?,
+               ai_next_retry_at=?,ai_last_failed_stage=?,ai_last_failed_model=?,updated_at=? WHERE id=?""",
+            (str(message)[:2000], retry_count, retry_at, stage, model, now, segment_id),
+        )
+        self.db.event("warning", "ai_waiting", f"模型任务失败，{delay // 60} 分钟后重试：{message}", {
+            "segment_id": segment_id, "retry_count": retry_count, "retry_at": retry_at,
+            "stage": stage, "model": model,
+        })
 
     def start(self) -> None:
         if self._started:
@@ -453,8 +592,46 @@ class HighlightPipeline:
         segment = self.db.one("SELECT * FROM recording_segments WHERE id=?", (segment_id,))
         if not segment:
             raise KeyError(segment_id)
-        self.db.update_segment_status(segment_id, "discovered", "")
+        self.db.execute(
+            """UPDATE recording_segments SET status='discovered',error='',ai_retry_count=0,
+               ai_next_retry_at='',ai_last_failed_stage='',ai_last_failed_model='',ai_abandoned_at='',updated_at=?
+               WHERE id=?""",
+            (utc_now(), segment_id),
+        )
         self._stage_stop.wait(0.01)
+
+    def abandon_ai_segments(self, segment_ids: list[int]) -> int:
+        if not segment_ids:
+            return 0
+        placeholders = ",".join("?" for _ in segment_ids)
+        now = utc_now()
+        return self.db.execute_changes(
+            f"""UPDATE recording_segments SET status='ai_abandoned',ai_abandoned_at=?,
+                ai_next_retry_at='',updated_at=? WHERE id IN ({placeholders})
+                AND status IN ('transcribed','ai_waiting','ai_retry_paused')""",
+            (now, now, *segment_ids),
+        )
+
+    def resume_ai_segments(self, segment_ids: list[int]) -> int:
+        if not segment_ids:
+            return 0
+        placeholders = ",".join("?" for _ in segment_ids)
+        return self.db.execute_changes(
+            f"""UPDATE recording_segments SET status='ai_waiting',error='',ai_retry_count=0,
+                ai_next_retry_at='',ai_last_failed_stage='',ai_last_failed_model='',ai_abandoned_at='',
+                updated_at=? WHERE id IN ({placeholders})
+                AND status IN ('ai_waiting','ai_retry_paused','ai_abandoned','transcribed')""",
+            (utc_now(), *segment_ids),
+        )
+
+    def reset_ai_circuit(self, clear_disabled: bool = False) -> None:
+        key = self._provider_key(self.settings.ai_base_url)
+        disabled_sql = ",disabled_models_json='[]'" if clear_disabled else ""
+        self.db.execute(
+            f"""UPDATE ai_provider_state SET consecutive_failures=0,circuit_open_until='',
+               last_error='',updated_at=?{disabled_sql} WHERE provider_key=?""",
+            (utc_now(), key),
+        )
 
     def _work(self) -> None:
         while True:
@@ -641,11 +818,17 @@ class HighlightPipeline:
 
     def _next_fair_ai_segment(self, lane_index: int) -> dict[str, Any] | None:
         with self._ai_claim_lock:
+            if self._provider_circuit_status(self.settings.ai_base_url)["open"]:
+                return None
+            now = utc_now()
             rows = self.db.all(
                 """SELECT s.*,COALESCE(r.sequence,'999999') AS room_sequence
                    FROM recording_segments s LEFT JOIN live_rooms r ON r.id=s.room_id
                    WHERE s.status IN ('transcribed','ai_waiting')
+                     AND s.ai_abandoned_at=''
+                     AND (s.ai_next_retry_at='' OR s.ai_next_retry_at<=?)
                    ORDER BY room_sequence,s.id"""
+                , (now,)
             )
             rows = [row for row in rows if self._primary_lane_for_segment(int(row["id"])) == lane_index]
             if not rows:
@@ -661,8 +844,9 @@ class HighlightPipeline:
             segment = first_by_room[chosen_room]
             claimed = self.db.execute_changes(
                 """UPDATE recording_segments SET status='gpt_analyzing',error='',updated_at=?
-                   WHERE id=? AND status IN ('transcribed','ai_waiting')""",
-                (utc_now(), segment["id"]),
+                   WHERE id=? AND status IN ('transcribed','ai_waiting')
+                     AND ai_abandoned_at='' AND (ai_next_retry_at='' OR ai_next_retry_at<=?)""",
+                (now, segment["id"], now),
             )
             if claimed != 1:
                 return None
@@ -679,16 +863,19 @@ class HighlightPipeline:
             segment_id = int(segment["id"])
             try:
                 self.analyze_segment_windows(segment, lane_index=lane_index)
-                self.db.update_segment_status(segment_id, "complete")
+                self.db.execute(
+                    """UPDATE recording_segments SET status='complete',error='',ai_retry_count=0,
+                       ai_next_retry_at='',ai_last_failed_stage='',ai_last_failed_model='',updated_at=? WHERE id=?""",
+                    (utc_now(), segment_id),
+                )
                 if segment.get("room_id"):
                     self.db.execute(
                         "UPDATE live_rooms SET last_processed_at=?,last_error='',updated_at=? WHERE id=?",
                         (utc_now(), utc_now(), segment["room_id"]),
                     )
             except AIUnavailable as exc:
-                self.db.update_segment_status(segment_id, "ai_waiting", str(exc))
-                self.db.event("warning", "ai_waiting", str(exc), {"segment_id": segment_id})
-                self._stage_stop.wait(self.settings.ai_retry_seconds)
+                self._schedule_ai_retry(segment_id, str(exc), "gpt")
+                self._stage_stop.wait(1)
             except Exception as exc:  # noqa: BLE001
                 self.db.update_segment_status(segment_id, "error", str(exc))
                 self.db.event("error", "ai", f"模型分析失败：{exc}", {"segment_id": segment_id})
@@ -771,27 +958,29 @@ class HighlightPipeline:
             current = self.db.one("SELECT * FROM recording_segments WHERE id=?", (segment_id,)) or segment
             deepseek_done = self._completed_window_keys(current, "deepseek_windows_done_json")
             excluded_ranges = self._candidate_ranges(segment["session_id"], primary_only=True)
-            try:
-                for since, until in windows:
-                    window_key = self._window_key(since, until)
-                    if window_key in deepseek_done:
-                        continue
-                    self.db.update_segment_status(segment_id, "deepseek_analyzing")
+            for since, until in windows:
+                window_key = self._window_key(since, until)
+                if window_key in deepseek_done:
+                    continue
+                self.db.update_segment_status(segment_id, "deepseek_analyzing")
+                try:
                     with self._ai_model_locks[self.supplement_analyzer.analysis_version]:
                         self._analyze_window(
                             segment, since, until, self.supplement_analyzer, excluded_ranges
                         )
-                    self._mark_window_complete(
-                        segment_id, "deepseek_windows_done_json", window_key
+                except Exception as exc:  # supplemental model must not replay paid primary requests
+                    self.db.event(
+                        "warning", "deepseek_supplement",
+                        f"DeepSeek 补漏暂时失败，本窗口跳过补漏，GPT 主选继续进入后续流程：{exc}",
+                        {"segment_id": segment_id, "window": window_key},
                     )
-                    deepseek_done.add(window_key)
-            except Exception as exc:  # supplemental model must not discard primary results
-                self.db.event(
-                    "warning", "deepseek_supplement",
-                    f"DeepSeek 补漏暂时失败，GPT 主选已保留：{exc}",
-                    {"segment_id": segment_id},
+                # Whether supplement succeeded or was skipped, persist the
+                # window as handled. This prevents a supplement outage from
+                # replaying an already-paid GPT primary request.
+                self._mark_window_complete(
+                    segment_id, "deepseek_windows_done_json", window_key
                 )
-                raise AIUnavailable(str(exc)) from exc
+                deepseek_done.add(window_key)
         self.db.update_segment_status(segment_id, "analyzed")
         self.db.mark_segment_stage(segment_id, "analyzed")
 
@@ -875,14 +1064,27 @@ class HighlightPipeline:
         if self.fallback_analyzer:
             ordered.append(self.fallback_analyzer)
         errors: list[str] = []
+        initial_provider_state = self._provider_circuit_status(
+            str(getattr(getattr(ordered[0], "settings", None), "ai_base_url", ""))
+        )
+        if initial_provider_state["open"]:
+            raise AIUnavailable(
+                f"中转站连接已暂停保护，约 {max(1, initial_provider_state['remaining_seconds'] // 60)} 分钟后自动恢复"
+            )
         for index, analyzer in enumerate(ordered):
             model_name = getattr(getattr(analyzer, "settings", None), "ai_model", "GPT 主模型")
+            base_url = str(getattr(getattr(analyzer, "settings", None), "ai_base_url", ""))
+            provider_state = self._provider_circuit_status(base_url)
+            if model_name in provider_state["disabled_models"]:
+                errors.append(f"{model_name}: 当前中转站分组不支持，已自动停用")
+                continue
             try:
                 lock = self._ai_model_locks.setdefault(analyzer.analysis_version, threading.Lock())
                 with lock:
                     self._analyze_window(
                         segment, since, until, analyzer, primary_request=True
                     )
+                self._record_provider_success(base_url)
                 if index:
                     self.db.event(
                         "warning", "ai_failover",
@@ -892,11 +1094,17 @@ class HighlightPipeline:
                 return analyzer
             except AIUnavailable as exc:
                 errors.append(f"{model_name}: {exc}")
+                category = self._record_provider_failure(base_url, model_name, str(exc))
                 self.db.event(
                     "warning", "ai_route_failed",
-                    f"{model_name} 暂时失败，准备尝试下一条模型线路：{exc}",
-                    {"segment_id": segment["id"], "model": model_name},
+                    f"{model_name} 线路失败：{exc}",
+                    {"segment_id": segment["id"], "model": model_name, "category": category},
                 )
+                # The primary routes share the same relay. A TLS/network/auth
+                # failure therefore affects every model on that relay; trying
+                # all of them only repeats paid work and amplifies an outage.
+                if category in {"transport", "auth", "rate_limit"}:
+                    raise AIUnavailable(f"{model_name}: {exc}") from exc
         raise AIUnavailable("；".join(errors))
 
     @staticmethod

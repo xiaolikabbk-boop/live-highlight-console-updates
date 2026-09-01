@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -26,6 +27,7 @@ from starlette.background import BackgroundTask
 
 from .config import settings
 from .db import Database, json_field, utc_now
+from .guardian import Guardian
 from .media import MediaError, MediaTools, evenly_timed_captions
 from .pipeline import HighlightPipeline, safe_id
 from .room_backup import export_room_backup, import_room_backup
@@ -36,6 +38,7 @@ from .text_normalize import simplify_value, to_simplified
 db = Database(settings.db_path)
 pipeline = HighlightPipeline(settings, db)
 media = pipeline.media
+guardian = Guardian(settings, db, pipeline)
 templates = Jinja2Templates(directory=str(settings.service_root / "app" / "templates"))
 
 
@@ -309,6 +312,8 @@ def room_processing_state(room: dict[str, Any]) -> tuple[str, str]:
         ("deepseek_analyzing", "deepseek", "DeepSeek补漏中"),
         ("transcribed", "queued", "等待模型分析"),
         ("ai_waiting", "retry", "模型重试中"),
+        ("ai_retry_paused", "error", "模型重试已暂停"),
+        ("ai_abandoned", "paused", "模型任务已舍弃"),
         ("discovered", "queued", "等待处理"),
         ("rendering", "rendering", "渲染中"),
     ):
@@ -331,7 +336,7 @@ def room_cards() -> list[dict[str, Any]]:
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.analyzed_at<>'' AND s.status<>'cleaned') AS segment_analyzed,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status='discovered') AS waiting_asr,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status='transcribing') AS active_asr,
-           (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('transcribed','ai_waiting')) AS waiting_ai,
+           (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('transcribed','ai_waiting','ai_retry_paused')) AS waiting_ai,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('gpt_analyzing','deepseek_analyzing')) AS active_ai,
            (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='visual_review'
               AND EXISTS (SELECT 1 FROM recording_segments s WHERE s.session_id=h.session_id
@@ -342,7 +347,7 @@ def room_cards() -> list[dict[str, Any]]:
            (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='rendering') AS active_render,
            (SELECT COUNT(*) FROM highlight_candidates h WHERE h.room_id=r.id AND h.status='render_error') AS render_error_count,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.analyzed_at<>'' AND s.status<>'cleaned') AS segment_processed,
-           (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('error','asr_unavailable')) AS segment_errors,
+           (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status IN ('error','asr_unavailable','ai_retry_paused')) AS segment_errors,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id AND s.status<>'cleaned' AND EXISTS(
               SELECT 1 FROM highlight_candidates h WHERE h.session_id=s.session_id
                 AND h.status NOT IN ('superseded','rejected','render_error')
@@ -654,6 +659,16 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             "state": "idle", "state_label": "空闲", "current": "当前没有处理任务",
             "elapsed": "—", "hint": "队列为空，运行正常",
         }
+        if spec["key"] == "ai" and ai_routes.get("circuit_open"):
+            remaining = int(ai_routes.get("circuit_remaining_seconds") or 0)
+            item.update(
+                state="stalled", state_label="中转站保护中",
+                current="检测到连续连接故障，已暂停所有模型请求，防止重复计费",
+                elapsed=f"{_elapsed_text(remaining)}后重试",
+                hint=str(ai_routes.get("last_error") or "等待中转站连接恢复")[:240],
+            )
+            result.append(item)
+            continue
         if active:
             started = _database_time(str(active.get("render_started_at") or active.get("updated_at") or ""))
             elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
@@ -701,6 +716,16 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
                 if spec["key"] == "render":
                     item["hint"] = f"实际编码器 {renderer['encoder']}；{renderer['note']}"
         elif spec["waiting"]:
+            if spec["key"] == "ai" and int(ai_routes.get("delayed_count") or 0):
+                delayed = int(ai_routes["delayed_count"])
+                paused = int(ai_routes.get("paused_count") or 0)
+                item.update(
+                    state="waiting", state_label="退避等待",
+                    current=f"{delayed} 个任务正在延迟重试" + (f"，{paused} 个已暂停" if paused else ""),
+                    hint="故障任务不会立即循环；后续正常任务仍可继续处理",
+                )
+                result.append(item)
+                continue
             if last_elapsed is not None and last_elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能停滞", current="有任务积压，但当前未检测到处理项", hint="最近完成时间较久，建议刷新后继续观察或查看运行日志")
             else:
@@ -1033,6 +1058,11 @@ def open_model_key_config() -> dict[str, Any]:
         ("HIGHLIGHT_AI_FALLBACK_API_KEY", ""),
         ("HIGHLIGHT_AI_FALLBACK_MODEL", "gpt-5.4-mini"),
         ("HIGHLIGHT_AI_WORKER_COUNT", "2"),
+        ("HIGHLIGHT_GUARDIAN_AI_BASE_URL", "https://api.sisct2.xyz/v1"),
+        ("HIGHLIGHT_GUARDIAN_AI_API_KEY", ""),
+        ("HIGHLIGHT_GUARDIAN_AI_MODEL", "gpt-5.5"),
+        ("HIGHLIGHT_GUARDIAN_VISION_API_KEY", ""),
+        ("HIGHLIGHT_GUARDIAN_VISION_MODEL", "gpt-5.5"),
     ]
     missing = [(key, value) for key, value in defaults if key not in present]
     if missing:
@@ -1050,6 +1080,107 @@ def open_model_key_config() -> dict[str, Any]:
         "message": "密钥配置已打开；保存后请关闭中控台并重新启动，配置才会生效",
         "added_fields": [key for key, _ in missing],
     }
+
+
+class GuardianActionRequest(BaseModel):
+    action: Literal["abandon", "resume"]
+    segment_ids: list[int] = Field(default_factory=list, max_length=200)
+    confirm: bool = False
+
+
+def guardian_problem_ids(include_abandoned: bool = False, message: str = "") -> list[int]:
+    statuses = "('ai_waiting','ai_retry_paused','ai_abandoned')" if include_abandoned else "('ai_waiting','ai_retry_paused')"
+    rows = db.all(
+        f"""SELECT s.id,COALESCE(r.sequence,'') AS room_sequence,COALESCE(r.name,'') AS room_name
+            FROM recording_segments s LEFT JOIN live_rooms r ON r.id=s.room_id
+            WHERE s.status IN {statuses} ORDER BY s.id LIMIT 200"""
+    )
+    requested_ids = {
+        int(value) for value in re.findall(r"(?:任务|分片|#)\s*#?(\d+)", message, flags=re.I)
+    }
+    requested_rooms = set(re.findall(r"直播间\s*0*(\d{1,6})", message))
+    named_rooms = {
+        str(row["room_name"]) for row in rows
+        if len(str(row.get("room_name") or "")) >= 2 and str(row["room_name"]) in message
+    }
+    if requested_ids:
+        rows = [row for row in rows if int(row["id"]) in requested_ids]
+    elif requested_rooms or named_rooms:
+        rows = [
+            row for row in rows
+            if str(row.get("room_sequence") or "").lstrip("0") in requested_rooms
+            or str(row.get("room_name") or "") in named_rooms
+        ]
+    return [int(row["id"]) for row in rows]
+
+
+@app.post("/api/guardian/chat")
+async def guardian_chat(message: str = Form(default=""), image: UploadFile | None = File(default=None)) -> dict[str, Any]:
+    message = message.strip() or ("请分析这张程序截图" if image else "播报当前程序状态")
+    lowered = message.lower()
+    if "导出" in message and any(word in message for word in ("诊断", "日志", "数据包")):
+        package = guardian.export_diagnostics()
+        return {
+            "ok": True, "source": "local", "severity": "ok",
+            "answer": "脱敏诊断包已经生成，不包含密钥、Cookie、转写正文、录像或完整数据库。",
+            "download_url": f"/api/guardian/diagnostics/{quote(package.name)}",
+        }
+    if any(word in message for word in ("舍弃", "放弃", "不要这批")):
+        ids = guardian_problem_ids(message=message)
+        if not ids:
+            return {"ok": True, "source": "local", "severity": "ok", "answer": "当前没有可舍弃的异常模型任务。"}
+        return {
+            "ok": True, "source": "local", "severity": "warning",
+            "answer": f"找到 {len(ids)} 个正在重试或已暂停的模型任务。舍弃只会停止这些任务，不会立即删除录像和转写；以后仍可恢复。",
+            "pending_action": {"action": "abandon", "segment_ids": ids, "label": f"确认舍弃 {len(ids)} 个任务"},
+        }
+    if any(word in message for word in ("继续尝试", "继续重试", "恢复任务", "重新尝试")):
+        ids = guardian_problem_ids(include_abandoned=True, message=message)
+        if not ids:
+            return {"ok": True, "source": "local", "severity": "ok", "answer": "当前没有需要恢复的模型任务。"}
+        return {
+            "ok": True, "source": "local", "severity": "warning",
+            "answer": f"可以恢复 {len(ids)} 个延迟、暂停或已舍弃的任务，同时解除中转站保护。恢复后会重新产生模型请求和费用。",
+            "pending_action": {"action": "resume", "segment_ids": ids, "label": f"确认恢复 {len(ids)} 个任务"},
+        }
+    image_payload: tuple[bytes, str] | None = None
+    if image:
+        mime = str(image.content_type or "")
+        if mime not in {"image/png", "image/jpeg", "image/webp"}:
+            raise HTTPException(422, "只支持 PNG、JPG 或 WebP 截图")
+        raw = await image.read(5 * 1024 * 1024 + 1)
+        if len(raw) > 5 * 1024 * 1024:
+            raise HTTPException(413, "截图不能超过 5MB")
+        image_payload = (raw, mime)
+    return {"ok": True, **guardian.answer(message, image=image_payload)}
+
+
+@app.post("/api/guardian/action")
+def guardian_action(payload: GuardianActionRequest) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(422, "必须在网页中明确确认后才能执行")
+    ids = sorted({int(item) for item in payload.segment_ids if int(item) > 0})
+    if not ids:
+        raise HTTPException(422, "没有选择任务")
+    if payload.action == "abandon":
+        changed = pipeline.abandon_ai_segments(ids)
+        db.event("warning", "guardian_abandon", f"用户通过AI管家舍弃了 {changed} 个异常模型任务", {"segment_ids": ids})
+        return {"ok": True, "message": f"已停止 {changed} 个任务；数据仍保留，可通过管家恢复"}
+    changed = pipeline.resume_ai_segments(ids)
+    pipeline.reset_ai_circuit(clear_disabled=True)
+    db.event("info", "guardian_resume", f"用户通过AI管家恢复了 {changed} 个模型任务", {"segment_ids": ids})
+    return {"ok": True, "message": f"已恢复 {changed} 个任务，并解除中转站保护"}
+
+
+@app.get("/api/guardian/diagnostics/{filename}")
+def guardian_diagnostics_download(filename: str) -> FileResponse:
+    safe_name = Path(filename).name
+    if safe_name != filename or not safe_name.startswith("AI管家诊断包_") or not safe_name.endswith(".zip"):
+        raise HTTPException(404, "诊断包不存在")
+    path = settings.data_dir / "diagnostics" / safe_name
+    if not path.is_file():
+        raise HTTPException(404, "诊断包不存在")
+    return FileResponse(path, filename=safe_name, media_type="application/zip")
 
 
 class RoomRequest(BaseModel):

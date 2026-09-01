@@ -60,6 +60,16 @@ class Database:
         CREATE INDEX IF NOT EXISTS ix_segments_session_time
             ON recording_segments(session_id, timeline_start);
 
+        CREATE TABLE IF NOT EXISTS ai_provider_state (
+            provider_key TEXT PRIMARY KEY,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            circuit_open_until TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_error_at TEXT NOT NULL DEFAULT '',
+            disabled_models_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS transcript_spans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             segment_id INTEGER NOT NULL REFERENCES recording_segments(id) ON DELETE CASCADE,
@@ -246,10 +256,18 @@ class Database:
                 "analyzed_at": "TEXT NOT NULL DEFAULT ''",
                 "gpt_windows_done_json": "TEXT NOT NULL DEFAULT '[]'",
                 "deepseek_windows_done_json": "TEXT NOT NULL DEFAULT '[]'",
+                "ai_retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "ai_next_retry_at": "TEXT NOT NULL DEFAULT ''",
+                "ai_last_failed_stage": "TEXT NOT NULL DEFAULT ''",
+                "ai_last_failed_model": "TEXT NOT NULL DEFAULT ''",
+                "ai_abandoned_at": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in segment_migrations.items():
                 if name not in segment_columns:
                     conn.execute(f"ALTER TABLE recording_segments ADD COLUMN {name} {definition}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_segments_ai_retry ON recording_segments(status,ai_next_retry_at,id)"
+            )
             room_columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_rooms)")}
             room_migrations = {
                 "live_status": "TEXT NOT NULL DEFAULT 'unknown'",

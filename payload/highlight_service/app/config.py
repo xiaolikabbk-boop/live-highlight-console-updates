@@ -76,6 +76,12 @@ class Settings:
     ai_max_output_tokens: int = 8000
     ai_vision_enabled: bool = False
     ai_vision_model: str = ""
+    guardian_ai_base_url: str = ""
+    guardian_ai_api_key: str = ""
+    guardian_ai_model: str = "gpt-5.5"
+    guardian_vision_api_key: str = ""
+    guardian_vision_model: str = "gpt-5.5"
+    guardian_ai_protocol: str = "chat"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-v4-pro"
@@ -117,6 +123,12 @@ class Settings:
             "HIGHLIGHT_AI_PROTOCOL": "ai_protocol",
             "HIGHLIGHT_AI_VISION_ENABLED": "ai_vision_enabled",
             "HIGHLIGHT_AI_VISION_MODEL": "ai_vision_model",
+            "HIGHLIGHT_GUARDIAN_AI_BASE_URL": "guardian_ai_base_url",
+            "HIGHLIGHT_GUARDIAN_AI_API_KEY": "guardian_ai_api_key",
+            "HIGHLIGHT_GUARDIAN_AI_MODEL": "guardian_ai_model",
+            "HIGHLIGHT_GUARDIAN_VISION_API_KEY": "guardian_vision_api_key",
+            "HIGHLIGHT_GUARDIAN_VISION_MODEL": "guardian_vision_model",
+            "HIGHLIGHT_GUARDIAN_AI_PROTOCOL": "guardian_ai_protocol",
             "HIGHLIGHT_DEEPSEEK_BASE_URL": "deepseek_base_url",
             "HIGHLIGHT_DEEPSEEK_API_KEY": "deepseek_api_key",
             "HIGHLIGHT_DEEPSEEK_MODEL": "deepseek_model",
@@ -148,6 +160,8 @@ class Settings:
         data["ai_api_key"] = "configured" if self.ai_api_key else ""
         data["ai_secondary_api_key"] = "configured" if self.ai_secondary_api_key else ""
         data["ai_fallback_api_key"] = "configured" if self.ai_fallback_api_key else ""
+        data["guardian_ai_api_key"] = "configured" if self.guardian_ai_api_key else ""
+        data["guardian_vision_api_key"] = "configured" if self.guardian_vision_api_key else ""
         data["deepseek_api_key"] = "configured" if self.deepseek_api_key else ""
         return {key: str(value) if isinstance(value, Path) else value for key, value in data.items()}
 

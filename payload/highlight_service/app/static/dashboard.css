@@ -141,6 +141,28 @@ main > .summary-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .room-card .actions button,
 .room-card .actions .button { padding: 8px 10px; font-size: 12px; }
 .room-card .actions .live-open { color: #fff; background: #0b8f5b; border-color: #0b8f5b; font-weight: 700; }
+.guardian-open { color: #fff; border-color: #6d4aff; background: linear-gradient(135deg,#6d4aff,#2970cc); font-weight: 700; }
+.guardian-dialog { width: min(880px,94vw); }
+.guardian-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.guardian-head h2 { margin-bottom: 4px; }
+.guardian-head p { margin: 0; color: var(--muted); font-size: 12px; }
+.guardian-quick { display: flex; flex-wrap: wrap; gap: 7px; margin: 14px 0; }
+.guardian-chat { height: min(430px,48vh); overflow: auto; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #f6f8fb; }
+.guardian-message { max-width: 88%; margin: 8px 0; padding: 10px 12px; border-radius: 10px; line-height: 1.55; white-space: pre-wrap; }
+.guardian-message p { margin: 0 0 7px; }
+.guardian-message.user { margin-left: auto; color: #fff; background: #2970cc; }
+.guardian-message.assistant { margin-right: auto; color: #27364b; background: #fff; border: 1px solid #e0e6ef; }
+.guardian-speak { padding: 5px 8px; color: #185cb8; background: #edf4ff; font-size: 11px; }
+.guardian-action { margin-top: 10px; padding: 12px; border: 1px solid #f0c9c5; border-radius: 9px; background: #fff7f6; }
+.guardian-action p { margin: 0 0 9px; }
+.guardian-action button { margin-right: 7px; }
+.guardian-compose { margin-top: 12px; }
+.guardian-compose textarea { width: 100%; resize: vertical; }
+.guardian-compose > div { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.guardian-compose > div #guardian-send { margin-left: auto; }
+.guardian-compose small { display: block; margin-top: 7px; color: var(--muted); }
+.guardian-file { cursor: pointer; }
+#guardian-file-name { max-width: 330px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 
 @media (max-width: 1180px) {
   .room-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
