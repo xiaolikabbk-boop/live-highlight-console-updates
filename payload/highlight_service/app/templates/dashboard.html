@@ -12,7 +12,7 @@
     <div class="summary"><b>{{ totals.yielded }}</b><span>有产出分片</span></div><div class="summary"><b>{{ totals.candidates }}</b><span>候选素材</span></div>
     <div class="summary"><b>{{ totals.pending }}</b><span>待审核</span></div><div class="summary"><b>{{ totals.effective }}</b><span>人工确认有效</span></div><div class="summary summary-warning"><b>{{ totals.render_errors }}</b><span>渲染异常</span></div>
   </section>
-  <section class="control-strip"><span class="status-dot {{ 'on' if recorder_running else 'off' }}"></span>录制器 {{ '运行中' if recorder_running else '未运行' }} · GPT {{ '已配置' if cloud_text else '未配置' }} · DeepSeek {{ '已启用' if deepseek_supplement else '未启用' }}<button class="secondary batch-room-open" onclick="showBatchRoomForm()">批量核对直播间</button><a class="button secondary" href="/api/rooms/export">导出直播间</a><button class="secondary" onclick="$('room-import-file').click()">导入直播间</button><input id="room-import-file" type="file" accept=".json,application/json" hidden onchange="importRooms(this)"><button class="primary" onclick="newRoom()">＋ 新增直播间</button></section>
+  <section class="control-strip"><span class="status-dot {{ 'on' if recorder_running else 'off' }}"></span>录制器 {{ '运行中' if recorder_running else '未运行' }} · GPT {{ ai_routes.label }}（{{ ai_routes.worker_count }}路）{% if ai_routes.fallback_model %} · 备用 {{ ai_routes.fallback_model }}{% endif %} · DeepSeek {{ '已启用' if deepseek_supplement else '未启用' }}<button class="secondary" onclick="openModelKeys()">填写模型密钥</button><button class="secondary batch-room-open" onclick="showBatchRoomForm()">批量核对直播间</button><a class="button secondary" href="/api/rooms/export">导出直播间</a><button class="secondary" onclick="$('room-import-file').click()">导入直播间</button><input id="room-import-file" type="file" accept=".json,application/json" hidden onchange="importRooms(this)"><button class="primary" onclick="newRoom()">＋ 新增直播间</button></section>
   <section class="update-strip"><div><b>程序更新</b><span>当前版本 {{ app_version }} · 更新只替换程序代码，数据和密钥不动</span></div><div class="update-actions"><span id="update-message"></span><button id="check-update-button" class="secondary" onclick="checkProgramUpdate()">检查更新</button><button id="install-update-button" class="primary hidden" onclick="installProgramUpdate()">安装更新</button></div></section>
   <section class="room-filter-panel">
     <label class="room-search-filter"><span>搜索直播间</span><input id="room-filter-search" type="search" placeholder="输入序号、名称或链接" oninput="applyRoomFilters()"></label>
@@ -22,12 +22,12 @@
   </section>
   <section class="scheduler-strip">
     {% for stage in processing_health %}<article class="stage-health stage-{{ stage.state }}">
-      <header><b>{{ stage.title }}{% if stage.key != 'render' %} · 单路{% endif %}</b><span class="stage-state"><i></i>{{ stage.state_label }}</span></header>
+      <header><b>{{ stage.title }}{% if stage.key == 'asr' %} · 单路{% endif %}</b><span class="stage-state"><i></i>{{ stage.state_label }}</span></header>
       <p class="stage-current">{{ stage.current }}</p>
       <div class="stage-facts"><span>队列等待 <b>{{ stage.waiting }}</b></span><span>本项已运行 <b>{{ stage.elapsed }}</b></span></div>
       <p class="stage-last">最近完成：{{ stage.last_completed }}</p><small>{{ stage.hint }}</small>
     </article>{% endfor %}
-    <p class="scheduler-note">页面每30秒自动自检。转写和模型保持单路；渲染会自动检测显卡，NVENC 可用时双路，不可用或失败时自动回退 CPU 单路。</p>
+    <p class="scheduler-note">页面每30秒自动自检。转写保持单路；GPT-5.5 与 GPT-5.4 可双路并行，主线路失败时由其他线路或 GPT-5.4-mini 接续；渲染会自动检测显卡，NVENC 可用时双路。</p>
   </section>
   <details class="runtime-log"><summary>运行日志与当前录制情况</summary><div class="runtime-log-body">
     {% for room in rooms %}<p><b>{{ room.sequence }} · {{ room.name }}</b>：{% if room.recording_active %}<span class="log-good">正在录制，已录 {{ room.active_elapsed_text }}，{{ room.active_size_mb }} MB，文件持续写入</span>{% elif room.enabled and room.live_state == 'live' %}<span class="log-wait">直播中，已开启录制，等待录制器建立文件</span>{% elif room.enabled %}已开启录制，当前未开播{% else %}录制暂停；静默状态检测仍在运行{% endif %}</p>{% endfor %}
@@ -71,6 +71,7 @@ let updateInstalling=false,availableUpdateVersion='';
 const $=id=>document.getElementById(id);function showRoomForm(){$('room-form').classList.remove('hidden');document.body.classList.add('modal-open')}function hideRoomForm(){$('room-form').classList.add('hidden');document.body.classList.remove('modal-open');$('room-message').textContent=''}
 function errorText(detail){if(typeof detail==='string')return detail;if(Array.isArray(detail))return detail.map(item=>item.msg||item.message||JSON.stringify(item)).join('；');if(detail&&typeof detail==='object')return detail.msg||detail.message||JSON.stringify(detail);return '操作失败'}
 function escapeHtml(value){return String(value).replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]))}
+async function openModelKeys(){const r=await fetch('/api/config/open-model-keys',{method:'POST'}),d=await r.json();if(!r.ok){alert(errorText(d.detail));return}alert(d.message)}
 function showBatchRoomForm(){$('room-batch-form').classList.remove('hidden');document.body.classList.add('modal-open');$('room-batch-text').focus()}
 function hideBatchRoomForm(){$('room-batch-form').classList.add('hidden');document.body.classList.remove('modal-open');$('room-batch-message').textContent=''}
 const roomFilterStorageKey='live-highlight-room-filters-v1';

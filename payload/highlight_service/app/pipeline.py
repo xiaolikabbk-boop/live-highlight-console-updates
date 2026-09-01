@@ -270,7 +270,31 @@ class HighlightPipeline:
         self.media = MediaTools(settings)
         self.rooms = RoomRegistry(settings, db)
         self.transcriber = WhisperTranscriber(settings)
-        self.analyzer = CandidateAnalyzer(settings)
+        primary_settings = [settings]
+        if settings.ai_secondary_api_key and settings.ai_secondary_model:
+            primary_settings.append(replace(
+                settings,
+                ai_api_key=settings.ai_secondary_api_key,
+                ai_model=settings.ai_secondary_model,
+                ai_vision_enabled=False,
+            ))
+        self.primary_analyzers = [
+            CandidateAnalyzer(item, analysis_label=item.ai_model)
+            for item in primary_settings if item.ai_api_key and item.ai_model
+        ]
+        # Keep the historical attribute for health checks, vision and scripts.
+        self.analyzer = self.primary_analyzers[0] if self.primary_analyzers else CandidateAnalyzer(settings)
+        self.fallback_analyzer: CandidateAnalyzer | None = None
+        if settings.ai_fallback_api_key and settings.ai_fallback_model:
+            fallback_settings = replace(
+                settings,
+                ai_api_key=settings.ai_fallback_api_key,
+                ai_model=settings.ai_fallback_model,
+                ai_vision_enabled=False,
+            )
+            self.fallback_analyzer = CandidateAnalyzer(
+                fallback_settings, analysis_label=settings.ai_fallback_model
+            )
         self.supplement_analyzer: CandidateAnalyzer | None = None
         if settings.deepseek_supplement_enabled and settings.deepseek_api_key:
             deepseek_settings = replace(
@@ -291,16 +315,41 @@ class HighlightPipeline:
         self.queue: queue.Queue[Path | None] = queue.Queue()
         self.watcher = SegmentWatcher(settings, db, self.enqueue)
         self._stage_stop = threading.Event()
+        self._ai_claim_lock = threading.Lock()
+        self._ai_model_locks = {
+            analyzer.analysis_version: threading.Lock()
+            for analyzer in [
+                *self.primary_analyzers,
+                *([self.fallback_analyzer] if self.fallback_analyzer else []),
+                *([self.supplement_analyzer] if self.supplement_analyzer else []),
+            ]
+        }
         self._render_claim_lock = threading.Lock()
         self._last_room: dict[str, int | None] = {"asr": None, "ai": None, "render": None}
         self._worker = threading.Thread(target=self._work, name="segment-discovery", daemon=True)
         self._asr_worker = threading.Thread(target=self._asr_loop, name="asr-worker-1", daemon=True)
-        self._ai_worker = threading.Thread(target=self._ai_loop, name="ai-worker-1", daemon=True)
+        ai_worker_count = min(
+            max(1, int(settings.ai_worker_count)), max(1, len(self.primary_analyzers))
+        )
+        self._ai_workers = [
+            threading.Thread(target=self._ai_loop, args=(index,), name=f"ai-worker-{index + 1}", daemon=True)
+            for index in range(ai_worker_count)
+        ]
         self._render_workers = [
             threading.Thread(target=self._render_loop, args=(index,), name=f"render-worker-{index}", daemon=True)
             for index in (1, 2)
         ]
         self._started = False
+
+    def ai_route_status(self) -> dict[str, Any]:
+        primary = [item.settings.ai_model for item in self.primary_analyzers]
+        fallback = self.fallback_analyzer.settings.ai_model if self.fallback_analyzer else ""
+        return {
+            "primary_models": primary,
+            "fallback_model": fallback,
+            "worker_count": len(self._ai_workers),
+            "label": " + ".join(primary) if primary else "未配置",
+        }
 
     def start(self) -> None:
         if self._started:
@@ -326,14 +375,15 @@ class HighlightPipeline:
         self.recorder.start()
         self._worker.start()
         self._asr_worker.start()
-        self._ai_worker.start()
+        for worker in self._ai_workers:
+            worker.start()
         for worker in self._render_workers:
             worker.start()
         self.watcher.start()
         renderer = self.media.renderer_status()
         self.db.event(
             "info", "service",
-            f"分阶段公平调度服务已启动（转写/模型单路，渲染{renderer['mode']} · {renderer['encoder']}）",
+            f"分阶段公平调度服务已启动（转写单路，模型{len(self._ai_workers)}路，渲染{renderer['mode']} · {renderer['encoder']}）",
         )
 
     def _recover_interrupted_segments(self) -> None:
@@ -392,7 +442,7 @@ class HighlightPipeline:
         self._stage_stop.set()
         self.queue.put(None)
         self._worker.join(timeout=10)
-        for worker in (self._asr_worker, self._ai_worker, *self._render_workers):
+        for worker in (self._asr_worker, *self._ai_workers, *self._render_workers):
             worker.join(timeout=10)
         self._started = False
 
@@ -581,15 +631,54 @@ class HighlightPipeline:
         finally:
             audio_path.unlink(missing_ok=True)
 
-    def _ai_loop(self) -> None:
+    def _primary_lane_for_segment(self, segment_id: int) -> int:
+        if len(self.primary_analyzers) <= 1:
+            return 0
+        # Stable 60/40 split: GPT-5.5 receives three out of every five
+        # segments, GPT-5.4 receives the other two. A retry or restart keeps
+        # the same preferred model for the segment.
+        return 0 if segment_id % 5 in {0, 1, 2} else 1
+
+    def _next_fair_ai_segment(self, lane_index: int) -> dict[str, Any] | None:
+        with self._ai_claim_lock:
+            rows = self.db.all(
+                """SELECT s.*,COALESCE(r.sequence,'999999') AS room_sequence
+                   FROM recording_segments s LEFT JOIN live_rooms r ON r.id=s.room_id
+                   WHERE s.status IN ('transcribed','ai_waiting')
+                   ORDER BY room_sequence,s.id"""
+            )
+            rows = [row for row in rows if self._primary_lane_for_segment(int(row["id"])) == lane_index]
+            if not rows:
+                return None
+            first_by_room: dict[int, dict[str, Any]] = {}
+            for row in rows:
+                first_by_room.setdefault(int(row.get("room_id") or 0), row)
+            room_ids = list(first_by_room)
+            stage_key = f"ai:{lane_index}"
+            last = self._last_room.get(stage_key)
+            index = (room_ids.index(last) + 1) % len(room_ids) if last in room_ids else 0
+            chosen_room = room_ids[index]
+            segment = first_by_room[chosen_room]
+            claimed = self.db.execute_changes(
+                """UPDATE recording_segments SET status='gpt_analyzing',error='',updated_at=?
+                   WHERE id=? AND status IN ('transcribed','ai_waiting')""",
+                (utc_now(), segment["id"]),
+            )
+            if claimed != 1:
+                return None
+            self._last_room[stage_key] = chosen_room
+            segment["status"] = "gpt_analyzing"
+            return segment
+
+    def _ai_loop(self, lane_index: int = 0) -> None:
         while not self._stage_stop.is_set():
-            segment = self._next_fair_segment("ai", ("transcribed", "ai_waiting"))
+            segment = self._next_fair_ai_segment(lane_index)
             if not segment:
                 self._stage_stop.wait(2)
                 continue
             segment_id = int(segment["id"])
             try:
-                self.analyze_segment_windows(segment)
+                self.analyze_segment_windows(segment, lane_index=lane_index)
                 self.db.update_segment_status(segment_id, "complete")
                 if segment.get("room_id"):
                     self.db.execute(
@@ -662,36 +751,36 @@ class HighlightPipeline:
                 continue
             self._visual_review_and_render(int(candidate["id"]), worker_name)
 
-    def analyze_segment_windows(self, segment: dict[str, Any]) -> None:
+    def analyze_segment_windows(self, segment: dict[str, Any], lane_index: int | None = None) -> None:
         """Analyze each window once and persist progress after every paid request."""
         windows = self._analysis_windows(segment)
         segment_id = int(segment["id"])
         current = self.db.one("SELECT * FROM recording_segments WHERE id=?", (segment_id,)) or segment
         gpt_done = self._completed_window_keys(current, "gpt_windows_done_json")
+        preferred_lane = self._primary_lane_for_segment(segment_id) if lane_index is None else lane_index
         for since, until in windows:
             window_key = self._window_key(since, until)
             if window_key in gpt_done:
                 continue
             self.db.update_segment_status(segment_id, "gpt_analyzing")
-            self._analyze_window(segment, since, until, self.analyzer)
+            self._analyze_window_with_failover(segment, since, until, preferred_lane)
             self._mark_window_complete(segment_id, "gpt_windows_done_json", window_key)
             gpt_done.add(window_key)
 
         if self.supplement_analyzer:
             current = self.db.one("SELECT * FROM recording_segments WHERE id=?", (segment_id,)) or segment
             deepseek_done = self._completed_window_keys(current, "deepseek_windows_done_json")
-            excluded_ranges = self._candidate_ranges(
-                segment["session_id"], self.analyzer.analysis_version
-            )
+            excluded_ranges = self._candidate_ranges(segment["session_id"], primary_only=True)
             try:
                 for since, until in windows:
                     window_key = self._window_key(since, until)
                     if window_key in deepseek_done:
                         continue
                     self.db.update_segment_status(segment_id, "deepseek_analyzing")
-                    self._analyze_window(
-                        segment, since, until, self.supplement_analyzer, excluded_ranges
-                    )
+                    with self._ai_model_locks[self.supplement_analyzer.analysis_version]:
+                        self._analyze_window(
+                            segment, since, until, self.supplement_analyzer, excluded_ranges
+                        )
                     self._mark_window_complete(
                         segment_id, "deepseek_windows_done_json", window_key
                     )
@@ -760,11 +849,12 @@ class HighlightPipeline:
     def _analyze_window(
         self, segment: dict[str, Any], since: float, until: float,
         analyzer: CandidateAnalyzer, excluded_ranges: list[dict[str, float]] | None = None,
+        primary_request: bool = False,
     ) -> None:
         spans = self.db.spans_for_session(segment["session_id"], since)
         spans = [span for span in spans if float(span["start_time"]) < until]
         on_submit = None
-        if analyzer is self.analyzer:
+        if primary_request:
             on_submit = lambda: self.db.mark_segment_stage(int(segment["id"]), "model_submitted")
         proposals = analyzer.analyze(spans, excluded_ranges=excluded_ranges, on_submit=on_submit)
         for proposal in proposals:
@@ -776,10 +866,52 @@ class HighlightPipeline:
                 continue
             candidate_id = self._create_candidate(segment, proposal, spans)
 
-    def _candidate_ranges(self, session_id: str, analysis_version: str) -> list[dict[str, float]]:
+    def _analyze_window_with_failover(
+        self, segment: dict[str, Any], since: float, until: float, preferred_lane: int,
+    ) -> CandidateAnalyzer:
+        available = self.primary_analyzers or [self.analyzer]
+        ordered = [available[preferred_lane % len(available)]]
+        ordered.extend(item for item in available if item is not ordered[0])
+        if self.fallback_analyzer:
+            ordered.append(self.fallback_analyzer)
+        errors: list[str] = []
+        for index, analyzer in enumerate(ordered):
+            model_name = getattr(getattr(analyzer, "settings", None), "ai_model", "GPT 主模型")
+            try:
+                lock = self._ai_model_locks.setdefault(analyzer.analysis_version, threading.Lock())
+                with lock:
+                    self._analyze_window(
+                        segment, since, until, analyzer, primary_request=True
+                    )
+                if index:
+                    self.db.event(
+                        "warning", "ai_failover",
+                        f"主线路暂时不可用，已由 {model_name} 接续完成",
+                        {"segment_id": segment["id"], "model": model_name},
+                    )
+                return analyzer
+            except AIUnavailable as exc:
+                errors.append(f"{model_name}: {exc}")
+                self.db.event(
+                    "warning", "ai_route_failed",
+                    f"{model_name} 暂时失败，准备尝试下一条模型线路：{exc}",
+                    {"segment_id": segment["id"], "model": model_name},
+                )
+        raise AIUnavailable("；".join(errors))
+
+    @staticmethod
+    def _is_supplement_analysis(analysis_version: str) -> bool:
+        return "deepseek" in str(analysis_version).lower()
+
+    def _candidate_ranges(
+        self, session_id: str, analysis_version: str = "", primary_only: bool = False,
+    ) -> list[dict[str, float]]:
         ranges: list[dict[str, float]] = []
         for candidate in self.db.active_candidates_for_session(session_id):
-            if candidate.get("analysis_version") != analysis_version:
+            candidate_version = str(candidate.get("analysis_version") or "")
+            if primary_only and self._is_supplement_analysis(candidate_version):
+                continue
+            if not primary_only and analysis_version and candidate_version != analysis_version:
                 continue
             try:
                 ranges.extend(json.loads(candidate.get("source_ranges_json") or "[]"))
@@ -799,7 +931,16 @@ class HighlightPipeline:
         if new_duration <= 0:
             return True
         for existing in self.db.active_candidates_for_session(session_id):
-            if existing.get("analysis_version") != analysis_version:
+            existing_version = str(existing.get("analysis_version") or "")
+            # All GPT routes are one primary selection family. This prevents a
+            # fallback model from recreating material already selected by a
+            # different GPT route while keeping DeepSeek supplementation
+            # independent.
+            same_family = (
+                self._is_supplement_analysis(existing_version)
+                == self._is_supplement_analysis(analysis_version)
+            )
+            if not same_family:
                 continue
             try:
                 old_ranges = [

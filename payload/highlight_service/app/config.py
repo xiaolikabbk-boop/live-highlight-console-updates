@@ -63,6 +63,11 @@ class Settings:
     ai_base_url: str = ""
     ai_api_key: str = ""
     ai_model: str = "gpt-5.5"
+    ai_secondary_api_key: str = ""
+    ai_secondary_model: str = "gpt-5.4"
+    ai_fallback_api_key: str = ""
+    ai_fallback_model: str = "gpt-5.4-mini"
+    ai_worker_count: int = 2
     ai_protocol: str = "auto"
     ai_timeout_seconds: int = 120
     ai_max_attempts: int = 3
@@ -104,6 +109,11 @@ class Settings:
             "HIGHLIGHT_AI_API_KEY": "ai_api_key",
             "HIGHLIGHT_AI_MODEL": "ai_model",
             "HIGHLIGHT_AI_TEXT_MODEL": "ai_model",
+            "HIGHLIGHT_AI_SECONDARY_API_KEY": "ai_secondary_api_key",
+            "HIGHLIGHT_AI_SECONDARY_MODEL": "ai_secondary_model",
+            "HIGHLIGHT_AI_FALLBACK_API_KEY": "ai_fallback_api_key",
+            "HIGHLIGHT_AI_FALLBACK_MODEL": "ai_fallback_model",
+            "HIGHLIGHT_AI_WORKER_COUNT": "ai_worker_count",
             "HIGHLIGHT_AI_PROTOCOL": "ai_protocol",
             "HIGHLIGHT_AI_VISION_ENABLED": "ai_vision_enabled",
             "HIGHLIGHT_AI_VISION_MODEL": "ai_vision_model",
@@ -136,6 +146,8 @@ class Settings:
     def public_dict(self) -> dict:
         data = asdict(self)
         data["ai_api_key"] = "configured" if self.ai_api_key else ""
+        data["ai_secondary_api_key"] = "configured" if self.ai_secondary_api_key else ""
+        data["ai_fallback_api_key"] = "configured" if self.ai_fallback_api_key else ""
         data["deepseek_api_key"] = "configured" if self.deepseek_api_key else ""
         return {key: str(value) if isinstance(value, Path) else value for key, value in data.items()}
 

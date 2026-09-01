@@ -161,7 +161,15 @@ def candidate_view(row: dict[str, Any]) -> dict[str, Any]:
         result["duration"] = round(float(result["end_time"]) - float(result["start_time"]), 2)
     result["source_ranges_text"] = json.dumps(result["source_ranges"], ensure_ascii=False)
     result["caption_text"] = "\n".join(item.get("text", "") for item in result["captions"])
-    result["model_role"] = "DeepSeek 补漏" if "deepseek" in result.get("analysis_version", "").lower() else "GPT-5.5 主选"
+    analysis_version = str(result.get("analysis_version") or "").lower()
+    if "deepseek" in analysis_version:
+        result["model_role"] = "DeepSeek 补漏"
+    elif "gpt-5.4-mini" in analysis_version:
+        result["model_role"] = "GPT-5.4-mini 备用主选"
+    elif "gpt-5.4" in analysis_version:
+        result["model_role"] = "GPT-5.4 主选"
+    else:
+        result["model_role"] = "GPT-5.5 主选"
     try:
         created = datetime.fromisoformat(str(result.get("created_at") or "").replace("Z", "+00:00"))
         if created.tzinfo is None:
@@ -589,6 +597,14 @@ def _recent_time_text(value: str) -> tuple[str, float | None]:
 
 def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
     renderer = pipeline.media.renderer_status()
+    ai_routes = pipeline.ai_route_status()
+    ai_active = db.all(
+        """SELECT s.id,s.source_id,s.status,s.updated_at,r.sequence,r.name AS room_name
+           FROM recording_segments s LEFT JOIN live_rooms r ON r.id=s.room_id
+           WHERE s.status IN ('gpt_analyzing','deepseek_analyzing')
+           ORDER BY s.updated_at LIMIT ?""",
+        (max(1, int(ai_routes["worker_count"])),),
+    )
     render_active = db.all(
         """SELECT h.id,h.source_id,h.render_phase,h.render_started_at,h.render_worker,
                   h.render_encoder,h.updated_at,r.sequence,r.name AS room_name
@@ -608,13 +624,10 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             "noun": "分片",
         },
         {
-            "key": "ai", "title": "双模型分析", "waiting": int(totals["waiting_ai"]),
+            "key": "ai", "title": f"多模型分析 · {ai_routes['worker_count']}路", "waiting": int(totals["waiting_ai"]),
             "warn": 10 * 60, "danger": 25 * 60,
-            "active": db.one(
-                """SELECT s.id,s.source_id,s.status,s.updated_at,r.sequence,r.name AS room_name
-                   FROM recording_segments s LEFT JOIN live_rooms r ON r.id=s.room_id
-                   WHERE s.status IN ('gpt_analyzing','deepseek_analyzing') ORDER BY s.updated_at LIMIT 1"""
-            ),
+            "active": ai_active[0] if ai_active else None,
+            "active_items": ai_active,
             "last": (db.one("SELECT MAX(analyzed_at) AS value FROM recording_segments") or {}).get("value", ""),
             "noun": "分片",
         },
@@ -667,6 +680,17 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
                     )
                 item["current"] = "；".join(descriptions)
                 item["hint"] = f"实际编码器 {renderer['encoder']}；{renderer['note']}"
+            elif spec["key"] == "ai":
+                descriptions = []
+                for job in spec.get("active_items", []):
+                    stage = "DeepSeek 补漏" if job.get("status") == "deepseek_analyzing" else "GPT 主选"
+                    room = " · ".join(part for part in (
+                        str(job.get("sequence") or ""), str(job.get("room_name") or job.get("source_id") or "")
+                    ) if part)
+                    descriptions.append(f"#{job['id']} {room} · {stage}")
+                item["current"] = "；".join(descriptions)
+                fallback = f"；备用 {ai_routes['fallback_model']}" if ai_routes["fallback_model"] else ""
+                item["hint"] = f"主线路 {ai_routes['label']}{fallback}；失败会自动换线并保留任务"
             item["elapsed"] = _elapsed_text(elapsed)
             if elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能卡住", hint="单项运行时间明显过长，建议查看任务管理器或错误日志")
@@ -799,6 +823,7 @@ def control_center(request: Request) -> HTMLResponse:
         "processing_health": processing_health(totals),
         "recorder_running": pipeline.recorder.running,
         "cloud_text": pipeline.analyzer.cloud.text_enabled,
+        "ai_routes": pipeline.ai_route_status(),
         "deepseek_supplement": bool(pipeline.supplement_analyzer),
         "recent_events": recent_events,
     })
@@ -841,6 +866,7 @@ def dashboard(request: Request, status: str = "pending_review", room_id: str = "
         "asr_available": pipeline.transcriber.available,
         "asr_runtime": pipeline.transcriber.runtime,
         "cloud_text": pipeline.analyzer.cloud.text_enabled,
+        "ai_routes": pipeline.ai_route_status(),
         "deepseek_supplement": bool(pipeline.supplement_analyzer),
         "recorder_running": pipeline.recorder.running,
         "cloud_vision": pipeline.analyzer.cloud.vision_enabled,
@@ -980,10 +1006,49 @@ def health() -> dict[str, Any]:
         },
         "asr_available": pipeline.transcriber.available,
         "cloud_text_enabled": pipeline.analyzer.cloud.text_enabled,
+        "ai_routes": pipeline.ai_route_status(),
         "deepseek_supplement_enabled": bool(pipeline.supplement_analyzer),
         "recorder_running": pipeline.recorder.running,
         "cloud_vision_enabled": pipeline.analyzer.cloud.vision_enabled,
         "settings": settings.public_dict(),
+    }
+
+
+@app.post("/api/config/open-model-keys")
+def open_model_key_config() -> dict[str, Any]:
+    """Add missing multi-model fields without changing existing secrets, then open Notepad."""
+    env_path = settings.service_root / ".env"
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    present = {
+        line.split("=", 1)[0].strip()
+        for line in existing.splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    }
+    defaults = [
+        ("HIGHLIGHT_AI_BASE_URL", "https://api.sisct2.xyz/v1"),
+        ("HIGHLIGHT_AI_API_KEY", ""),
+        ("HIGHLIGHT_AI_MODEL", "gpt-5.5"),
+        ("HIGHLIGHT_AI_SECONDARY_API_KEY", ""),
+        ("HIGHLIGHT_AI_SECONDARY_MODEL", "gpt-5.4"),
+        ("HIGHLIGHT_AI_FALLBACK_API_KEY", ""),
+        ("HIGHLIGHT_AI_FALLBACK_MODEL", "gpt-5.4-mini"),
+        ("HIGHLIGHT_AI_WORKER_COUNT", "2"),
+    ]
+    missing = [(key, value) for key, value in defaults if key not in present]
+    if missing:
+        prefix = "\n" if existing and not existing.endswith("\n") else ""
+        addition = prefix + "\n# GPT 多模型并行与自动备用线路\n" + "".join(
+            f"{key}={value}\n" for key, value in missing
+        )
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        with env_path.open("a", encoding="utf-8") as handle:
+            handle.write(addition)
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(["notepad.exe", str(env_path)], creationflags=creationflags)
+    return {
+        "ok": True,
+        "message": "密钥配置已打开；保存后请关闭中控台并重新启动，配置才会生效",
+        "added_fields": [key for key, _ in missing],
     }
 
 

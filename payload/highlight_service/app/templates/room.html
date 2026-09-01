@@ -63,7 +63,7 @@
       {% for c in candidates %}
         <tr>
           <td><a href="/review?room_id={{ room.id }}#candidate-{{ c.id }}">#{{ c.id }}</a></td>
-          <td>{{ 'DeepSeek补漏' if 'deepseek' in c.analysis_version else 'GPT主选' }}</td>
+          <td>{% if 'deepseek' in c.analysis_version %}DeepSeek补漏{% elif 'gpt-5.4-mini' in c.analysis_version %}GPT-5.4-mini备用{% elif 'gpt-5.4' in c.analysis_version %}GPT-5.4主选{% else %}GPT-5.5主选{% endif %}</td>
           <td><span class="status-chip {{ c.status }}">{{ {'pending_review':'待审核','deferred':'暂存待用','accepted':'已接受','rejected':'不需要','exported':'已打包','superseded':'已作废','render_error':'渲染异常'}.get(c.status,c.status) }}</span></td>
           <td><div class="source-list">{% for source in c.source_segments %}<span class="source-chip">#{{ source.id }} · {{ source.filename }}</span>{% else %}<span>未找到来源</span>{% endfor %}</div></td>
           <td>{{ '%.3f'|format(c.start_time) }}–{{ '%.3f'|format(c.end_time) }}</td><td>{{ c.updated_at }}</td>

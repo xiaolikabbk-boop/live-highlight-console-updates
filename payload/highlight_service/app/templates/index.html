@@ -16,7 +16,7 @@
     <section class="health-grid review-health">
       <div class="health {{ 'ok' if recorder_running else 'warn' }}"><b>直播录制器</b><span>{{ '自动值守运行中' if recorder_running else '等待自动启动' }}</span></div>
       <div class="health {{ 'ok' if asr_available else 'warn' }}"><b>本地转写</b><span>{{ asr_runtime if asr_available else '未安装 Whisper' }}</span></div>
-      <div class="health {{ 'ok' if cloud_text else 'warn' }}"><b>GPT 语义剪辑</b><span>{{ 'gpt-5.5 已配置' if cloud_text else '等待配置 API Key' }}</span></div>
+      <div class="health {{ 'ok' if cloud_text else 'warn' }}"><b>GPT 语义剪辑</b><span>{{ ai_routes.label }} · {{ ai_routes.worker_count }}路{% if ai_routes.fallback_model %} · 备用 {{ ai_routes.fallback_model }}{% endif %}</span></div>
       <div class="health {{ 'ok' if deepseek_supplement else 'warn' }}"><b>DeepSeek 补漏</b><span>{{ '自动补漏已启用' if deepseek_supplement else '未启用' }}</span></div>
       <div class="health {{ 'ok' if cloud_vision else 'warn' }}"><b>商品一致性</b><span>{{ '线上视觉已启用' if cloud_vision else '本地关键帧（免费）' }}</span></div>
       <div class="health"><b>录像目录</b><span title="{{ input_dir }}">{{ input_dir }}</span></div>
@@ -31,7 +31,7 @@
     </section>
     <form id="review-filters" class="filter-bar smart-filter-bar review-filter-bar" method="get" action="/review"><input type="hidden" name="status" value="{{ selected_status }}">
       <label class="select-filter">直播间<select name="room_id" onchange="applyFilters(this.form)"><option value="">全部直播间</option>{% for room in rooms %}<option value="{{ room.id }}" {{ 'selected' if selected_room_id==room.id else '' }}>{{ room.sequence }} · {{ room.name }}</option>{% endfor %}</select></label>
-      <label class="select-filter">模型<select name="model" onchange="applyFilters(this.form)"><option value="">全部模型</option><option value="gpt" {{ 'selected' if selected_model=='gpt' else '' }}>GPT-5.5 主选</option><option value="deepseek" {{ 'selected' if selected_model=='deepseek' else '' }}>DeepSeek 补漏</option></select></label>
+      <label class="select-filter">模型<select name="model" onchange="applyFilters(this.form)"><option value="">全部模型</option><option value="gpt" {{ 'selected' if selected_model=='gpt' else '' }}>GPT 多线路主选</option><option value="deepseek" {{ 'selected' if selected_model=='deepseek' else '' }}>DeepSeek 补漏</option></select></label>
       <div class="date-filter"><label>产出日期（北京时间）<input id="review-output-date" type="date" name="output_date" value="{{ selected_output_date }}" onclick="openDatePicker(this)" onchange="applyFilters(this.form)"></label><div class="quick-dates"><button type="button" onclick="setQuickDate('review-output-date',0)">今天</button><button type="button" onclick="setQuickDate('review-output-date',-1)">昨天</button><button type="button" onclick="clearDate('review-output-date')">清除</button></div></div>
       <div class="filter-actions"><button class="secondary" type="submit">应用筛选</button><button class="secondary" type="button" onclick="clearReviewFilters(this.form)">清除全部</button></div>
     </form>
