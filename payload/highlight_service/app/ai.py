@@ -16,19 +16,19 @@ from .text_normalize import simplify_value, to_simplified
 
 
 ANALYSIS_VERSION = "clause-select-v3-5min"
-PROMPT_VERSION = "live-to-short-video-2026-08-11-v4-5min"
+PROMPT_VERSION = "live-to-short-video-2026-09-01-v5-compact"
 
 SYSTEM_PROMPT = """你是直播录屏转商品短视频的内容剪辑导演。你的任务不是寻找一段连续的直播话术，而是逐句判断哪些原话适合独立发布为商品短视频。所有返回文字必须使用简体中文，禁止输出繁体字。
 
 只保留：产品身份、设计/版型、面料/材质、工艺、功能、穿着感受、适合人群、使用场景，以及脱离直播间后仍成立的具体产品卖点。
 
-必须删除：开播留人和憋单；价格、券、补贴；链接、购物车、上架和助播改价；倒计时和库存催单；身高体重及尺码推荐；点赞关注评论等互动；明星或公众人物姓名；“全网最低、第一、唯一、国家级、世界级、百分之百、绝对、永远、完全不会”等平台高风险绝对词；医疗治疗功效。输入里标为 hard_removed 的短语绝不可选择，但要结合它前后的干净片段判断是否仍有可用产品内容。
+必须删除：开播留人和憋单；价格、券、补贴；链接、购物车、上架和助播改价；倒计时和库存催单；身高体重及尺码推荐；点赞关注评论等互动；明星或公众人物姓名；“全网最低、第一、唯一、国家级、世界级、百分之百、绝对、永远、完全不会”等平台高风险绝对词；医疗治疗功效。本地规则已提前移除明确违规句，不要猜测或补回输入中不存在的内容。
 
 可以保留行业常见的商品卖点表达，例如显瘦、凉快、速干、不掉色、不起球、不沾毛、不勒、一个鸡蛋重量等。不要仅因它略带宣传性就删除；这类内容交给人工审核核对商品真实性，除非句中同时出现上述平台红线词。
 
 品牌历史、门店数量、工艺设备、成本和竞品比较不由本地规则预先删除。你要从“能否独立成为商品短视频内容、是否具体可信、是否过度跑题”的角度判断；有产品价值可以保留，只有纯背书吹嘘、贬低竞品或无法形成产品表达时才删除。
 
-按句子 ID 选择，不要估计秒数。输入最多覆盖 5 分钟，其中可能切换商品。每条候选只能取自同一商品，在该输入中删掉无用句，再按原顺序拼成 15–20 秒；不得改序，不得跨商品，不得为了凑时长留下违规或空话。某个主题内容不足 15 秒就不输出。
+输入是紧凑 JSON 数组，每项字段 i=句子ID、s=开始秒、e=结束秒、t=原话。按 i 选择，不要估计秒数。输入最多覆盖 5 分钟，其中可能切换商品。每条候选只能取自同一商品，在该输入中删掉无用句，再按原顺序拼成 15–20 秒；不得改序，不得跨商品，不得为了凑时长留下违规或空话。某个主题内容不足 15 秒就不输出。
 
 不要只选“最好的几条”。请完整寻找输入中所有互不重复、可独立发布的有效主题；只要质量合格就输出，数量可以是 0 条，也可以有多条。同一卖点换一种近似说法不重复输出，但不同卖点、不同适合人群或不同商品应分别输出。
 
@@ -36,9 +36,9 @@ SYSTEM_PROMPT = """你是直播录屏转商品短视频的内容剪辑导演。�
 
 剪辑限制：所选句子必须自然聚合成 1–5 个连续保留区间，相邻保留句时间间隔不超过 0.45 秒才算同一区间；超过即算新的一刀。严禁超过 5 刀。优先选择连续、信息密集的完整表达，不要用短碎句补时长。
 
-只返回 JSON：
-{"candidates":[{"theme":"主题","keep_clause_ids":["S0001"],"caption_corrections":{"S0001":"纠正后的原意文字"},"sales_score":0.0,"coherence_score":0.0,"confidence":0.0,"reason":"选择理由","risks":[]}]}
-最多 10 条作为接口安全上限；没有合格内容返回 {"candidates":[]}。"""
+只返回紧凑 JSON，不要解释：
+{"c":[{"ids":["S0001"],"fix":{"S0001":"纠正后的原意文字"},"s":0.0,"q":0.0,"cf":0.0,"why":"选择理由","risk":[]}]}
+s=销售表达分，q=连贯分，cf=置信度。why最多40个汉字，每条risk最多30个汉字；无需纠错时fix返回空对象。最多10条；没有合格内容返回 {"c":[]}。"""
 
 VISION_PROMPT = """这些图片按成片的源时间顺序排列。只判断是否仍是同一类商品；换颜色、姿势或镜头远近不算换商品。只返回 JSON：{"same_product":true,"confidence":0.0,"reason":"理由"}。"""
 
@@ -156,20 +156,35 @@ class OpenAICompatibleClient:
         ) from last_error
 
     def analyze_clauses(self, clauses: list[Clause], task_instruction: str = "") -> list[dict[str, Any]]:
+        clauses = [clause for clause in clauses if not clause.hard_hits]
+        if not clauses:
+            return []
         if not self.text_enabled:
             raise AIUnavailable("尚未配置中转站 Base URL、API Key 和模型，任务已保留等待")
         payload = [{
-            "id": c.id, "start": c.start, "end": c.end, "duration": round(c.end - c.start, 3),
-            "text": c.text, "hard_removed": bool(c.hard_hits), "hard_hits": list(c.hard_hits),
+            "i": c.id, "s": round(c.start, 2), "e": round(c.end, 2), "t": c.text,
         } for c in clauses]
-        user_text = "逐句筛选以下转写：\n" + json.dumps(payload, ensure_ascii=False)
+        user_text = "逐句筛选以下转写：\n" + json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        )
         if task_instruction:
             user_text = task_instruction + "\n\n" + user_text
         result = simplify_value(self._json_request([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text},
         ]))
-        return list(result.get("candidates") or [])
+        compact = result.get("c")
+        if compact is None:
+            return list(result.get("candidates") or [])
+        return [{
+            "keep_clause_ids": item.get("ids") or [],
+            "caption_corrections": item.get("fix") or {},
+            "sales_score": item.get("s", 0),
+            "coherence_score": item.get("q", 0),
+            "confidence": item.get("cf", 0),
+            "reason": item.get("why") or "",
+            "risks": item.get("risk") or [],
+        } for item in compact if isinstance(item, dict)]
 
     def analyze_frames(self, frames: list[Path]) -> dict[str, Any]:
         if not self.vision_enabled:
@@ -197,8 +212,6 @@ class CandidateAnalyzer:
         if not clauses:
             return []
         excluded_ranges = excluded_ranges or []
-        if on_submit:
-            on_submit()
         if excluded_ranges:
             clauses = [
                 Clause(
@@ -211,13 +224,18 @@ class CandidateAnalyzer:
                 )
                 for clause in clauses
             ]
+        eligible_clauses = [clause for clause in clauses if not clause.hard_hits]
+        if not eligible_clauses:
+            return []
+        if on_submit:
+            on_submit()
+        if excluded_ranges:
             raw = self.cloud.analyze_clauses(
-                clauses,
-                "这是补漏任务。标为 GPT主选已采用 的句子已经生成过候选，绝不可再次选择。"
-                "只从其余句子中寻找新的可用片段；没有新增内容就返回 0 条。",
+                eligible_clauses,
+                "这是补漏任务。此前已采用的句子已从输入移除，只寻找新的可用片段；没有新增内容就返回0条。",
             )
         else:
-            raw = self.cloud.analyze_clauses(clauses)
+            raw = self.cloud.analyze_clauses(eligible_clauses)
         return self._sanitize(raw, clauses)
 
     @staticmethod
