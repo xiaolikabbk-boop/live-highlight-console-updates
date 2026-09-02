@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import ctypes
+from collections import defaultdict, deque
 from ctypes import wintypes
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -294,20 +295,20 @@ class HighlightPipeline:
         self.rooms = RoomRegistry(settings, db)
         self.transcriber = WhisperTranscriber(settings)
         plus_key = settings.relay_plus_api_key or settings.ai_api_key
-        plus_model = settings.relay_plus_model if settings.relay_plus_api_key else settings.ai_model
+        plus_models = self._relay_models(settings.relay_plus_models) if settings.relay_plus_models else [settings.relay_plus_model if settings.relay_plus_api_key else settings.ai_model]
         pro_key = settings.relay_pro_api_key or settings.ai_secondary_api_key
-        pro_model = settings.relay_pro_model if settings.relay_pro_api_key else settings.ai_secondary_model
+        pro_models = self._relay_models(settings.relay_pro_models) if settings.relay_pro_models else [settings.relay_pro_model if settings.relay_pro_api_key else settings.ai_secondary_model]
         route_specs: list[tuple[str, str, Settings]] = []
-        if plus_key and plus_model:
-            route_specs.append(("relay_plus", "中转站 Plus", replace(
-                settings, ai_api_key=plus_key, ai_model=plus_model, ai_vision_enabled=False,
-                ai_max_attempts=1,
-            )))
-        if pro_key and pro_model:
-            route_specs.append(("relay_pro", "中转站 Pro", replace(
-                settings, ai_api_key=pro_key, ai_model=pro_model, ai_vision_enabled=False,
-                ai_max_attempts=1,
-            )))
+        for group_id, group_label, key, models, matrix_enabled in (
+            ("plus", "中转站 Plus", plus_key, plus_models, bool(settings.relay_plus_models)),
+            ("pro", "中转站 Pro", pro_key, pro_models, bool(settings.relay_pro_models)),
+        ):
+            for model in models:
+                if key and model:
+                    route_id = f"relay_{group_id}_{self._route_slug(model)}" if matrix_enabled else f"relay_{group_id}"
+                    route_specs.append((route_id, f"{group_label} {model}", replace(
+                        settings, ai_api_key=key, ai_model=model, ai_vision_enabled=False, ai_max_attempts=1,
+                    )))
         deepseek_settings: Settings | None = None
         if settings.deepseek_api_key and settings.deepseek_model:
             deepseek_settings = replace(
@@ -349,6 +350,7 @@ class HighlightPipeline:
         self._stage_stop = threading.Event()
         self._ai_claim_lock = threading.Lock()
         self._ai_state_lock = threading.Lock()
+        self._route_quality: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=30))
         route_locks: dict[str, threading.Lock] = {}
         self._ai_model_locks: dict[str, threading.Lock] = {}
         for analyzer in [
@@ -363,7 +365,7 @@ class HighlightPipeline:
         self._last_room: dict[str, int | None] = {"asr": None, "ai": None, "render": None}
         self._worker = threading.Thread(target=self._work, name="segment-discovery", daemon=True)
         self._asr_worker = threading.Thread(target=self._asr_loop, name="asr-worker-1", daemon=True)
-        ai_worker_count = max(1, len(self.primary_analyzers))
+        ai_worker_count = max(1, min(int(settings.ai_worker_count), len(self.primary_analyzers)))
         self._ai_workers = [
             threading.Thread(target=self._ai_loop, args=(index,), name=f"ai-worker-{index + 1}", daemon=True)
             for index in range(ai_worker_count)
@@ -384,6 +386,7 @@ class HighlightPipeline:
                 "id": route_id,
                 "label": str(getattr(analyzer, "route_label", analyzer.settings.ai_model)),
                 "model": analyzer.settings.ai_model,
+                "quality": round(self._route_quality_score(route_id), 3),
                 **circuit,
             })
         usable = [item for item in routes if not item["open"] and item["model"] not in item["disabled_models"]]
@@ -421,6 +424,29 @@ class HighlightPipeline:
                 model for item in routes for model in item["disabled_models"]
             }),
         }
+
+    @staticmethod
+    def _relay_models(value: str) -> list[str]:
+        seen: set[str] = set()
+        return [item for item in (part.strip() for part in str(value or "").split(",")) if item and not (item in seen or seen.add(item))]
+
+    @staticmethod
+    def _route_slug(model: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", model.lower()).strip("_") or "model"
+
+    def _route_quality_score(self, route_key: str) -> float:
+        samples = self._route_quality.get(route_key)
+        # Do not let a single lucky/failed request overturn the fair initial
+        # rotation; once three observations exist, recent stability takes over.
+        if not samples or len(samples) < 3:
+            return 0.5
+        # successful requests contribute positive values weighted by response time;
+        # failed attempts contribute zero, so recent stability dominates routing.
+        return sum(samples) / len(samples)
+
+    def _record_route_result(self, route_key: str, elapsed_seconds: float, success: bool) -> None:
+        value = max(0.05, 1.0 - min(max(elapsed_seconds, 0.0), 120.0) / 150.0) if success else 0.0
+        self._route_quality[route_key].append(value)
 
     @staticmethod
     def _provider_key(base_url: str) -> str:
@@ -1133,8 +1159,14 @@ class HighlightPipeline:
         self, segment: dict[str, Any], since: float, until: float, preferred_lane: int,
     ) -> CandidateAnalyzer:
         available = self.primary_analyzers or [self.analyzer]
-        ordered = [available[preferred_lane % len(available)]]
-        ordered.extend(item for item in available if item is not ordered[0])
+        # Prefer recent successful and fast routes. The lane index is only a
+        # tie-breaker, so a healthy route naturally stays primary until its
+        # recent quality drops, then the next healthy model takes over.
+        ordered = sorted(
+            available,
+            key=lambda item: (-self._route_quality_score(self._route_key(item)),
+                              (available.index(item) - preferred_lane) % len(available)),
+        )
         errors: list[str] = []
         for index, analyzer in enumerate(ordered):
             model_name = getattr(getattr(analyzer, "settings", None), "ai_model", "GPT 主模型")
@@ -1149,11 +1181,13 @@ class HighlightPipeline:
                 continue
             try:
                 lock = self._ai_model_locks.setdefault(analyzer.analysis_version, threading.Lock())
+                started = time.monotonic()
                 with lock:
                     self._analyze_window(
                         segment, since, until, analyzer, primary_request=True
                     )
                 self._record_provider_success(route_key)
+                self._record_route_result(route_key, time.monotonic() - started, True)
                 if index:
                     self.db.event(
                         "warning", "ai_failover",
@@ -1162,6 +1196,7 @@ class HighlightPipeline:
                     )
                 return analyzer
             except AIUnavailable as exc:
+                self._record_route_result(route_key, 0.0, False)
                 errors.append(f"{model_name}: {exc}")
                 category = self._record_provider_failure(route_key, model_name, str(exc))
                 self.db.event(

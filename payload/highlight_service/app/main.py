@@ -1067,9 +1067,9 @@ def open_model_key_config() -> dict[str, Any]:
     defaults = [
         ("HIGHLIGHT_AI_BASE_URL", "https://api.sisct2.xyz/v1"),
         ("HIGHLIGHT_RELAY_PLUS_API_KEY", ""),
-        ("HIGHLIGHT_RELAY_PLUS_MODEL", "gpt-5.6-terra"),
         ("HIGHLIGHT_RELAY_PRO_API_KEY", ""),
-        ("HIGHLIGHT_RELAY_PRO_MODEL", "gpt-5.5"),
+        ("HIGHLIGHT_RELAY_PLUS_MODELS", "gpt-5.4,gpt-5.5,gpt-5.6-terra"),
+        ("HIGHLIGHT_RELAY_PRO_MODELS", "gpt-5.4,gpt-5.5,gpt-5.6-terra"),
         ("HIGHLIGHT_DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         ("HIGHLIGHT_DEEPSEEK_API_KEY", ""),
         ("HIGHLIGHT_DEEPSEEK_MODEL", "deepseek-v4-pro"),
@@ -1086,10 +1086,10 @@ def open_model_key_config() -> dict[str, Any]:
     if missing:
         prefix = "\n" if existing and not existing.endswith("\n") else ""
         addition = prefix + (
-            "\n# ===== 三条主力模型线路（请按备注分别填写） =====\n"
-            "# Plus 组：gpt-5.6-terra 主力；填 Plus 分组生成的密钥\n"
-            "# Pro 组：gpt-5.5 主力；填 Pro 分组生成的密钥\n"
-            "# DeepSeek 官方：第三主力，同时只为中转站产出做补漏\n"
+            "\n# ===== 智能中转模型矩阵（每个分组一把密钥，可调用三种模型） =====\n"
+            "# Plus / Pro 各填一把本分组密钥；程序会按近期成功率和响应速度自动优先健康模型，失败立即切换。\n"
+            "# 默认每组测试：gpt-5.4、gpt-5.5、gpt-5.6-terra；若某个分组不支持其中一项，会只停用该模型槽位，其余继续运行。\n"
+            "# DeepSeek 官方配置保持原样：既可作独立主力，也只给中转站的成功产出做补漏。\n"
         ) + "".join(
             f"{key}={value}\n" for key, value in missing
         )

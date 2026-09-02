@@ -70,9 +70,11 @@ class Settings:
     # Explicit route names keep the two relay subscription groups separate.
     # The legacy AI_* fields above remain supported for in-place upgrades.
     relay_plus_api_key: str = ""
-    relay_plus_model: str = "gpt-5.6-terra"
+    relay_plus_model: str = "gpt-5.6-terra"  # legacy single-model setting
+    relay_plus_models: str = ""
     relay_pro_api_key: str = ""
-    relay_pro_model: str = "gpt-5.5"
+    relay_pro_model: str = "gpt-5.5"  # legacy single-model setting
+    relay_pro_models: str = ""
     ai_worker_count: int = 3
     ai_protocol: str = "auto"
     ai_timeout_seconds: int = 120
@@ -127,8 +129,10 @@ class Settings:
             "HIGHLIGHT_AI_FALLBACK_MODEL": "ai_fallback_model",
             "HIGHLIGHT_RELAY_PLUS_API_KEY": "relay_plus_api_key",
             "HIGHLIGHT_RELAY_PLUS_MODEL": "relay_plus_model",
+            "HIGHLIGHT_RELAY_PLUS_MODELS": "relay_plus_models",
             "HIGHLIGHT_RELAY_PRO_API_KEY": "relay_pro_api_key",
             "HIGHLIGHT_RELAY_PRO_MODEL": "relay_pro_model",
+            "HIGHLIGHT_RELAY_PRO_MODELS": "relay_pro_models",
             "HIGHLIGHT_AI_WORKER_COUNT": "ai_worker_count",
             "HIGHLIGHT_AI_PROTOCOL": "ai_protocol",
             "HIGHLIGHT_AI_VISION_ENABLED": "ai_vision_enabled",
