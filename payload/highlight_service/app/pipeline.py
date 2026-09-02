@@ -35,6 +35,10 @@ class RecorderSupervisor:
         self.db = db
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # DouyinLiveRecorder reads URL_config.ini only when it starts.  Keep
+        # this explicit rather than claiming a newly saved room is recording
+        # while the already-running recorder still has the old room list.
+        self._config_restart_required = False
 
     @property
     def running(self) -> bool:
@@ -107,8 +111,27 @@ class RecorderSupervisor:
             cwd=str(self.settings.recorder_root),
             creationflags=creationflags,
         )
+        self._config_restart_required = False
         self.db.event("info", "recorder", "已自动启动直播录制器")
         return True
+
+    @property
+    def config_restart_required(self) -> bool:
+        return self._config_restart_required
+
+    def note_config_changed(self) -> bool:
+        """Record that a running recorder must be restarted to read its new URLs.
+
+        This does not terminate the recorder: closing it can cut active files,
+        so the operator must explicitly choose a safe restart window.
+        """
+        if self.running:
+            self._config_restart_required = True
+            self.db.event(
+                "warning", "recorder_config_pending",
+                "直播间录制配置已更新；当前录制器仍使用旧名单，请在合适时机关闭黑色录制器窗口以应用新配置",
+            )
+        return self._config_restart_required
 
     def start(self) -> None:
         if not self.settings.recorder_auto_start:

@@ -860,6 +860,7 @@ def control_center(request: Request) -> HTMLResponse:
         "app_version": current_app_version(),
         "processing_health": processing_health(totals),
         "recorder_running": pipeline.recorder.running,
+        "recorder_config_restart_required": pipeline.recorder.config_restart_required,
         "cloud_text": pipeline.analyzer.cloud.text_enabled,
         "ai_routes": pipeline.ai_route_status(),
         "deepseek_supplement": bool(pipeline.supplement_analyzer),
@@ -1047,6 +1048,7 @@ def health() -> dict[str, Any]:
         "ai_routes": pipeline.ai_route_status(),
         "deepseek_supplement_enabled": bool(pipeline.supplement_analyzer),
         "recorder_running": pipeline.recorder.running,
+        "recorder_config_restart_required": pipeline.recorder.config_restart_required,
         "cloud_vision_enabled": pipeline.analyzer.cloud.vision_enabled,
         "settings": settings.public_dict(),
     }
@@ -1342,10 +1344,11 @@ def import_rooms(payload: dict[str, Any]) -> dict[str, Any]:
         result = import_room_backup(db, pipeline.rooms, payload)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    restart_required = pipeline.recorder.note_config_changed()
     pipeline.recorder.ensure_running()
     pipeline.live_monitor.request_refresh()
     db.event("info", "room_import", f"已导入直播间配置：新增 {result['created']}，更新 {result['updated']}")
-    return {"ok": True, **result}
+    return {"ok": True, "recorder_restart_required": restart_required, **result}
 
 
 @app.post("/api/rooms/batch-check")
@@ -1374,6 +1377,9 @@ def add_room_batch(payload: RoomBatchRequest) -> dict[str, Any]:
             created_rooms.append({"id": room_id, "sequence": sequence, "name": item["name"], "url": item["url"]})
         if created_ids:
             pipeline.rooms.sync()
+            restart_required = pipeline.recorder.note_config_changed()
+        else:
+            restart_required = False
     except Exception as exc:
         for room_id in reversed(created_ids):
             db.execute("DELETE FROM live_rooms WHERE id=?", (room_id,))
@@ -1389,7 +1395,8 @@ def add_room_batch(payload: RoomBatchRequest) -> dict[str, Any]:
         db.event("info", "room_batch", f"批量核对后新增 {len(created_ids)} 个直播间", {
             "room_ids": created_ids,
         })
-    return {"ok": True, "created": len(created_ids), "rooms": created_rooms, **analysis}
+    return {"ok": True, "created": len(created_ids), "rooms": created_rooms,
+            "recorder_restart_required": restart_required, **analysis}
 
 
 @app.post("/api/rooms")
@@ -1417,10 +1424,12 @@ def create_room(payload: RoomRequest) -> dict[str, Any]:
     # A fresh installation has no room, so the recorder is deliberately not
     # started at service boot.  Saving the first enabled room starts it only
     # after URL_config.ini has been written.
+    restart_required = pipeline.recorder.note_config_changed()
     pipeline.recorder.ensure_running()
     pipeline.live_monitor.request_refresh()
     db.event("info", "room", f"新增直播间 {sequence} · {name}", {"room_id": room_id})
-    return {"ok": True, "room": db.one("SELECT * FROM live_rooms WHERE id=?", (room_id,))}
+    return {"ok": True, "room": db.one("SELECT * FROM live_rooms WHERE id=?", (room_id,)),
+            "recorder_restart_required": restart_required}
 
 
 @app.patch("/api/rooms/{room_id}")
@@ -1458,8 +1467,10 @@ def update_room(room_id: int, payload: RoomPatch) -> dict[str, Any]:
              room["archived"], room.get("default_catalog_item_id"), room["notes"], room["updated_at"], room_id),
         )
         raise HTTPException(500, f"同步录制器配置失败：{exc}") from exc
+    restart_required = pipeline.recorder.note_config_changed()
     pipeline.live_monitor.request_refresh()
-    return {"ok": True, "room": db.one("SELECT * FROM live_rooms WHERE id=?", (room_id,))}
+    return {"ok": True, "room": db.one("SELECT * FROM live_rooms WHERE id=?", (room_id,)),
+            "recorder_restart_required": restart_required}
 
 
 @app.post("/api/rooms/{room_id}/toggle")
@@ -1468,8 +1479,10 @@ def toggle_room(room_id: int, payload: RoomToggle) -> dict[str, Any]:
         raise HTTPException(404, "直播间不存在")
     db.execute("UPDATE live_rooms SET enabled=?,updated_at=? WHERE id=?", (int(payload.enabled), utc_now(), room_id))
     pipeline.rooms.sync()
+    restart_required = pipeline.recorder.note_config_changed()
+    pipeline.recorder.ensure_running()
     pipeline.live_monitor.request_refresh()
-    return {"ok": True, "enabled": payload.enabled}
+    return {"ok": True, "enabled": payload.enabled, "recorder_restart_required": restart_required}
 
 
 @app.delete("/api/rooms/{room_id}")
@@ -1490,6 +1503,7 @@ def delete_room(room_id: int) -> dict[str, Any]:
         raise HTTPException(409, f"该直播间已有{summary}，不能直接删除；请使用归档以保留历史记录")
     db.execute("DELETE FROM live_rooms WHERE id=?", (room_id,))
     pipeline.rooms.sync()
+    pipeline.recorder.note_config_changed()
     pipeline.live_monitor.request_refresh()
     db.event("info", "room", f"已删除误填直播间 {room['sequence']} · {room['name']}")
     return {"ok": True}
