@@ -1398,3 +1398,7 @@ class HighlightPipeline:
                    reason=reason||?,updated_at=? WHERE id=?""",
                 (f"；渲染失败：{str(exc)[:500]}", utc_now(), candidate_id),
             )
+            self.db.event(
+                "error", "render_error", f"候选素材 #{candidate_id} 渲染失败：{str(exc)[:500]}",
+                {"candidate_id": candidate_id, "worker": worker_name, "encoder": self.media.active_encoder},
+            )

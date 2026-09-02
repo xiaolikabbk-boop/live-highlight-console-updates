@@ -51,6 +51,13 @@ class Guardian:
             """SELECT id,level,event_type,message,details_json,created_at FROM service_events
                WHERE level IN ('warning','error') ORDER BY id DESC LIMIT 80"""
         )
+        render_failures = self.db.all(
+            """SELECT c.id,c.room_id,c.source_id,c.session_id,c.status,c.render_phase,
+                      c.render_started_at,c.render_worker,c.render_encoder,c.updated_at,
+                      COALESCE(r.sequence,'') AS room_sequence,COALESCE(r.name,'') AS room_name
+               FROM highlight_candidates c LEFT JOIN live_rooms r ON r.id=c.room_id
+               WHERE c.status='render_error' ORDER BY c.updated_at DESC LIMIT 100"""
+        )
         route = self.pipeline.ai_route_status()
         return {
             "generated_at": utc_now(),
@@ -61,6 +68,7 @@ class Guardian:
             "ai_route": route,
             "problem_segments": delayed,
             "recent_errors": recent_errors,
+            "render_failures": render_failures,
         }
 
     def _version(self) -> str:
@@ -162,6 +170,10 @@ class Guardian:
                 }
                 for row in snapshot["recent_errors"][:12]
             ],
+            "render_failures": [
+                {key: row.get(key) for key in ("id", "room_sequence", "room_name", "render_phase", "render_worker", "render_encoder", "updated_at")}
+                for row in snapshot["render_failures"][:20]
+            ],
         }
         snapshot_text = json.dumps(compact_snapshot, ensure_ascii=False, separators=(",", ":"))
         user_text = f"用户问题：{message}\n本地状态快照：{snapshot_text}"
@@ -260,6 +272,13 @@ class Guardian:
         events = self.db.all(
             "SELECT id,level,event_type,message,details_json,created_at FROM service_events ORDER BY id DESC LIMIT 1000"
         )
+        render_failures = self.db.all(
+            """SELECT c.id,c.room_id,c.source_id,c.session_id,c.status,c.render_phase,
+                      c.render_started_at,c.render_worker,c.render_encoder,c.updated_at,
+                      COALESCE(r.sequence,'') AS room_sequence,COALESCE(r.name,'') AS room_name
+               FROM highlight_candidates c LEFT JOIN live_rooms r ON r.id=c.room_id
+               WHERE c.status='render_error' ORDER BY c.updated_at DESC LIMIT 500"""
+        )
         rooms = self.db.all(
             """SELECT id,sequence,name,enabled,archived,live_status,live_checked_at,
                       last_recording_at,last_processed_at,last_error FROM live_rooms ORDER BY sequence"""
@@ -275,6 +294,7 @@ class Guardian:
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             archive.writestr("segments.json", json.dumps(segments, ensure_ascii=False, indent=2))
             archive.writestr("events.json", json.dumps(events, ensure_ascii=False, indent=2))
+            archive.writestr("render-failures.json", json.dumps(render_failures, ensure_ascii=False, indent=2))
             archive.writestr("rooms.json", json.dumps(rooms, ensure_ascii=False, indent=2))
             archive.writestr("settings-masked.json", json.dumps(public_settings, ensure_ascii=False, indent=2))
         self.db.event("info", "guardian_diagnostics", f"AI管家已生成脱敏诊断包：{destination.name}")

@@ -1110,7 +1110,7 @@ def open_model_key_config() -> dict[str, Any]:
 
 
 class GuardianActionRequest(BaseModel):
-    action: Literal["abandon", "resume"]
+    action: Literal["abandon", "resume", "cleanup_history"]
     segment_ids: list[int] = Field(default_factory=list, max_length=200)
     confirm: bool = False
 
@@ -1141,6 +1141,112 @@ def guardian_problem_ids(include_abandoned: bool = False, message: str = "") -> 
     return [int(row["id"]) for row in rows]
 
 
+def _historical_failure_cutoff() -> str:
+    """Return the UTC boundary for the start of today in Beijing time."""
+    beijing = timezone(timedelta(hours=8))
+    today = datetime.now(beijing).replace(hour=0, minute=0, second=0, microsecond=0)
+    return today.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def historical_failure_cleanup_summary() -> dict[str, Any]:
+    """Count only failures from before today; live work must never be swept up."""
+    cutoff = _historical_failure_cutoff()
+    segment_count = int((db.one(
+        """SELECT COUNT(*) AS count FROM recording_segments
+           WHERE status IN ('error','asr_unavailable','ai_retry_paused') AND updated_at<?""",
+        (cutoff,),
+    ) or {"count": 0})["count"])
+    render_count = int((db.one(
+        """SELECT COUNT(*) AS count FROM highlight_candidates
+           WHERE status='render_error' AND updated_at<?""", (cutoff,),
+    ) or {"count": 0})["count"])
+    return {"cutoff": cutoff, "segment_count": segment_count, "render_count": render_count}
+
+
+def _historical_segment_has_live_candidate(segment: dict[str, Any]) -> bool:
+    candidates = db.all(
+        "SELECT * FROM highlight_candidates WHERE session_id=?", (segment["session_id"],)
+    )
+    return any(
+        candidate["status"] not in {"rejected", "superseded", "render_error"}
+        and _candidate_overlaps_segment(candidate, segment)
+        for candidate in candidates
+    )
+
+
+def cleanup_historical_failures() -> dict[str, Any]:
+    """Clear pre-today failed work after the user explicitly confirms it.
+
+    We retain source media if a non-failed candidate still needs it.  This is
+    deliberately more conservative than the visible red-status cleanup.
+    """
+    summary = historical_failure_cleanup_summary()
+    cutoff = summary["cutoff"]
+    render_rows = db.all(
+        "SELECT id FROM highlight_candidates WHERE status='render_error' AND updated_at<? ORDER BY id",
+        (cutoff,),
+    )
+    released = 0
+    for row in render_rows:
+        result = cleanup_candidate_media(int(row["id"]))
+        released += int(result["released_bytes"])
+    now = utc_now()
+    if render_rows:
+        placeholders = ",".join("?" for _ in render_rows)
+        db.execute(
+            f"""UPDATE highlight_candidates SET status='rejected',render_phase='cleaned',
+                reason=reason||'；历史渲染异常已清理，不再重试',updated_at=?
+                WHERE id IN ({placeholders})""",
+            (now, *(int(row["id"]) for row in render_rows)),
+        )
+    safe_completed_count = 0
+    for row in render_rows:
+        safe_result = cleanup_ready_segments_for_candidate(int(row["id"]))
+        safe_completed_count += int(safe_result["cleaned_count"])
+        released += int(safe_result["released_bytes"])
+
+    segment_rows = db.all(
+        """SELECT * FROM recording_segments
+           WHERE status IN ('error','asr_unavailable','ai_retry_paused') AND updated_at<? ORDER BY id""",
+        (cutoff,),
+    )
+    source_cleaned = 0
+    source_kept = 0
+    for segment in segment_rows:
+        segment_id = int(segment["id"])
+        if _historical_segment_has_live_candidate(segment):
+            source_kept += 1
+            released_for_segment = 0
+        else:
+            released_for_segment = media.invalidate_timeline(Path(segment["path"]))
+            released_for_segment += _unlink_cleanup_file(Path(segment["path"]), [settings.input_dir.resolve()])
+            released_for_segment += _unlink_cleanup_file(
+                settings.cache_dir / f"segment_{segment_id}.wav",
+                [settings.cache_dir.resolve()],
+            )
+            released += released_for_segment
+            source_cleaned += 1
+        db.execute(
+            """UPDATE recording_segments SET status='cleaned',error='',ai_next_retry_at='',
+               cleaned_at=?,released_bytes=released_bytes+?,updated_at=? WHERE id=?""",
+            (now, released_for_segment, now, segment_id),
+        )
+    db.event("info", "guardian_history_cleanup", "AI管家已清理历史异常任务", {
+        "before_utc": cutoff,
+        "segments": len(segment_rows),
+        "render_candidates": len(render_rows),
+        "source_cleaned": source_cleaned,
+        "source_kept": source_kept,
+        "released_bytes": released,
+        "safe_completed_segments": safe_completed_count,
+    })
+    return {
+        "segments": len(segment_rows), "render_candidates": len(render_rows),
+        "source_cleaned": source_cleaned, "source_kept": source_kept,
+        "released_bytes": released, "safe_completed_segments": safe_completed_count,
+    }
+
+
 @app.post("/api/guardian/chat")
 async def guardian_chat(message: str = Form(default=""), image: UploadFile | None = File(default=None)) -> dict[str, Any]:
     message = message.strip() or ("请分析这张程序截图" if image else "播报当前程序状态")
@@ -1151,6 +1257,21 @@ async def guardian_chat(message: str = Form(default=""), image: UploadFile | Non
             "ok": True, "source": "local", "severity": "ok",
             "answer": "脱敏诊断包已经生成，不包含密钥、Cookie、转写正文、录像或完整数据库。",
             "download_url": f"/api/guardian/diagnostics/{quote(package.name)}",
+        }
+    if any(word in message for word in ("清理", "删除", "不要")) and any(
+        word in message for word in ("历史", "红字", "异常", "渲染")
+    ):
+        summary = historical_failure_cleanup_summary()
+        total = summary["segment_count"] + summary["render_count"]
+        if not total:
+            return {"ok": True, "source": "local", "severity": "ok", "answer": "今天以前没有可清理的异常分片或渲染异常。"}
+        return {
+            "ok": True, "source": "local", "severity": "warning",
+            "answer": (
+                f"找到今天以前的异常分片 {summary['segment_count']} 个、渲染异常素材 {summary['render_count']} 个。"
+                "确认后会停止这些历史任务的重试，清理可安全删除的本机媒体；不会处理今天的任务、已导出成片或配置。"
+            ),
+            "pending_action": {"action": "cleanup_history", "segment_ids": [], "label": "确认清理历史异常"},
         }
     if any(word in message for word in ("舍弃", "放弃", "不要这批")):
         ids = guardian_problem_ids(message=message)
@@ -1186,6 +1307,14 @@ async def guardian_chat(message: str = Form(default=""), image: UploadFile | Non
 def guardian_action(payload: GuardianActionRequest) -> dict[str, Any]:
     if not payload.confirm:
         raise HTTPException(422, "必须在网页中明确确认后才能执行")
+    if payload.action == "cleanup_history":
+        result = cleanup_historical_failures()
+        released_mb = round(int(result["released_bytes"]) / (1024 ** 2), 1)
+        return {"ok": True, "message": (
+            f"已清理历史异常分片 {result['segments']} 个、渲染异常素材 {result['render_candidates']} 个，"
+            f"释放约 {released_mb} MB。本机媒体已清理 {result['source_cleaned']} 条；"
+            f"仍被正常候选引用而保留 {result['source_kept']} 条。"
+        )}
     ids = sorted({int(item) for item in payload.segment_ids if int(item) > 0})
     if not ids:
         raise HTTPException(422, "没有选择任务")
