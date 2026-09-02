@@ -623,6 +623,9 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
            ORDER BY s.updated_at LIMIT ?""",
         (max(1, int(ai_routes["worker_count"])),),
     )
+    active_models = pipeline.active_ai_jobs()
+    for job in ai_active:
+        job.update(active_models.get(int(job["id"]), {}))
     render_active = db.all(
         """SELECT h.id,h.source_id,h.render_phase,h.render_started_at,h.render_worker,
                   h.render_encoder,h.updated_at,r.sequence,r.name AS room_name
@@ -715,7 +718,8 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
                     room = " · ".join(part for part in (
                         str(job.get("sequence") or ""), str(job.get("room_name") or job.get("source_id") or "")
                     ) if part)
-                    descriptions.append(f"#{job['id']} {room} · {stage}")
+                    model = str(job.get("model") or stage)
+                    descriptions.append(f"#{job['id']} {room} · {model}")
                 item["current"] = "；".join(descriptions)
                 fallback = f"；备用 {ai_routes['fallback_model']}" if ai_routes["fallback_model"] else ""
                 item["hint"] = f"{ai_routes['route_summary']}{fallback}；单线失败会自动换线并保留任务"

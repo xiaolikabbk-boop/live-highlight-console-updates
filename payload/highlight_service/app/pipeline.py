@@ -351,6 +351,7 @@ class HighlightPipeline:
         self._ai_claim_lock = threading.Lock()
         self._ai_state_lock = threading.Lock()
         self._route_quality: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=30))
+        self._active_ai_jobs: dict[int, dict[str, str]] = {}
         route_locks: dict[str, threading.Lock] = {}
         self._ai_model_locks: dict[str, threading.Lock] = {}
         for analyzer in [
@@ -424,6 +425,10 @@ class HighlightPipeline:
                 model for item in routes for model in item["disabled_models"]
             }),
         }
+
+    def active_ai_jobs(self) -> dict[int, dict[str, str]]:
+        with self._ai_state_lock:
+            return {key: dict(value) for key, value in self._active_ai_jobs.items()}
 
     @staticmethod
     def _relay_models(value: str) -> list[str]:
@@ -1186,10 +1191,16 @@ class HighlightPipeline:
             try:
                 lock = self._ai_model_locks.setdefault(analyzer.analysis_version, threading.Lock())
                 started = time.monotonic()
-                with lock:
-                    self._analyze_window(
-                        segment, since, until, analyzer, primary_request=True
-                    )
+                with self._ai_state_lock:
+                    self._active_ai_jobs[int(segment["id"])] = {
+                        "model": model_name, "route": route_label,
+                    }
+                try:
+                    with lock:
+                        self._analyze_window(segment, since, until, analyzer, primary_request=True)
+                finally:
+                    with self._ai_state_lock:
+                        self._active_ai_jobs.pop(int(segment["id"]), None)
                 self._record_provider_success(route_key)
                 self._record_route_result(route_key, time.monotonic() - started, True)
                 if index:

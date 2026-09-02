@@ -55,6 +55,7 @@
     <div class="selected-room-heading"><div><span>当前直播间</span><h2>{{ selected_room_label or '直播间素材' }}</h2><p>{{ date_label }} · 待导出和已导出素材</p></div><a class="button secondary" href="/export?status=all{% if selected_model %}&model={{ selected_model }}{% endif %}{% if selected_output_date %}&output_date={{ selected_output_date }}{% endif %}&date_scope={{ selected_date_scope }}">← 返回全部直播间</a></div>
     <section class="export-batch-bar">
       <label class="select-all"><input id="select-all-export" type="checkbox" onchange="toggleAllExports(this.checked)"> 全选当前结果</label>
+      <button class="secondary" type="button" onclick="selectPendingExports()">全选待导出</button>
       <strong id="export-selected-count">已选 0 条</strong>
       <button id="batch-export-button" class="primary" type="button" onclick="batchExportZip()">批量生成并下载 ZIP</button>
       <span id="batch-export-message" class="message"></span>
@@ -102,6 +103,7 @@
     function selectedExportIds(){return [...document.querySelectorAll('.export-candidate-check:checked')].map(item=>Number(item.value))}
     function updateExportSelection(){const ids=selectedExportIds(),boxes=[...document.querySelectorAll('.export-candidate-check')];document.getElementById('export-selected-count').textContent=`已选 ${ids.length} 条`;const all=document.getElementById('select-all-export');all.checked=boxes.length>0&&ids.length===boxes.length;all.indeterminate=ids.length>0&&ids.length<boxes.length}
     function toggleAllExports(checked){document.querySelectorAll('.export-candidate-check').forEach(item=>item.checked=checked);updateExportSelection()}
+    function selectPendingExports(){document.querySelectorAll('.export-card').forEach(card=>{const waiting=card.querySelector('.export-status.waiting'),check=card.querySelector('.export-candidate-check');if(check)check.checked=!!waiting});updateExportSelection()}
     async function batchExportZip(){const ids=selectedExportIds(),box=document.getElementById('batch-export-message'),button=document.getElementById('batch-export-button');if(!ids.length){box.textContent='请先勾选要导出的素材';box.className='message error';return}button.disabled=true;box.textContent=`正在把 ${ids.length} 条现成视频放入 ZIP…`;box.className='message';try{const res=await fetch('/api/candidates/batch-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids})});const data=await res.json();if(!res.ok)throw new Error(errorText(data.detail)||'批量导出失败');box.textContent=`ZIP 已生成，正在交给浏览器下载：${data.filename}`;box.className='message success';button.disabled=false;window.location.assign(data.download_url)}catch(error){box.textContent=error.message;box.className='message error';button.disabled=false}}
     if(document.getElementById('select-all-export'))updateExportSelection()
   </script>
