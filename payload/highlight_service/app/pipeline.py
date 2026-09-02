@@ -924,7 +924,11 @@ class HighlightPipeline:
                    ORDER BY room_sequence,s.id"""
                 , (now,)
             )
-            rows = [row for row in rows if self._primary_lane_for_segment(int(row["id"])) == lane_index]
+            # Model routes can outnumber worker threads. Assign the fair
+            # route bucket to an available worker modulo its count, otherwise
+            # a two-worker installation would never claim buckets 3..N.
+            worker_count = max(1, len(self._ai_workers))
+            rows = [row for row in rows if self._primary_lane_for_segment(int(row["id"])) % worker_count == lane_index]
             if not rows:
                 return None
             first_by_room: dict[int, dict[str, Any]] = {}
