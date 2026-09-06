@@ -42,6 +42,35 @@ try {
         Start-Process -FilePath "notepad.exe" -ArgumentList ('"' + $EnvFile + '"') -Wait
     }
 
+    # The Windows CTranslate2 wheel uses CUDA 12 plus NVIDIA's cuBLAS/cuDNN 9
+    # DLLs.  Install the official Python-packaged runtime once on CUDA systems.
+    # Existing data, models and queued jobs are not touched.
+    $CudaRequested = Select-String -LiteralPath $EnvFile -Pattern '^HIGHLIGHT_WHISPER_DEVICE=\s*cuda\s*$' -Quiet
+    $NvidiaSmi = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+    $SitePackages = Join-Path $Root "runtime\Lib\site-packages"
+    $CublasBin = Join-Path $SitePackages "nvidia\cublas\bin"
+    $CudnnBin = Join-Path $SitePackages "nvidia\cudnn\bin"
+    $CublasDll = Join-Path $CublasBin "cublas64_12.dll"
+    $CudnnDll = Join-Path $CudnnBin "cudnn_ops64_9.dll"
+    if ($CudaRequested -and $NvidiaSmi -and
+        (-not (Test-Path -LiteralPath $CublasDll) -or -not (Test-Path -LiteralPath $CudnnDll))) {
+        Write-Host ""
+        Write-Host "NVIDIA GPU detected. Installing the GPU transcription runtime..." -ForegroundColor Cyan
+        Write-Host "This one-time download is large and can take 5-20 minutes." -ForegroundColor Yellow
+        Write-Host "Download progress will appear below. Please keep this window open." -ForegroundColor Yellow
+        & $PythonExe -m pip install --disable-pip-version-check --upgrade --progress-bar on nvidia-cublas-cu12 nvidia-cudnn-cu12
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $CublasDll) -and (Test-Path -LiteralPath $CudnnDll)) {
+            Write-Host "GPU transcription runtime installed successfully." -ForegroundColor Green
+        }
+        else {
+            Write-Host "GPU runtime installation did not complete. The console will continue with CPU fallback." -ForegroundColor Yellow
+            Write-Host "Restart the console later to retry the installation." -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+    if (Test-Path -LiteralPath $CublasBin) { $env:PATH = "$CublasBin;$env:PATH" }
+    if (Test-Path -LiteralPath $CudnnBin) { $env:PATH = "$CudnnBin;$env:PATH" }
+
     $env:HF_HOME = Join-Path $ServiceRoot "data\models"
     Push-Location $ServiceRoot
     $Pushed = $true

@@ -1,11 +1,48 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
+
+
+# NVIDIA publishes the Windows CUDA libraries used by CTranslate2 as Python
+# packages.  Their DLL folders are not automatically added to the Windows DLL
+# search path, so make them visible before faster-whisper imports CTranslate2.
+# Keep the directory handles alive for the lifetime of the process.
+_NVIDIA_DLL_HANDLES: list[Any] = []
+
+
+def activate_bundled_nvidia_libraries() -> list[Path]:
+    if os.name != "nt":
+        return []
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+    candidates = [
+        site_packages / "nvidia" / "cublas" / "bin",
+        site_packages / "nvidia" / "cudnn" / "bin",
+    ]
+    existing = [path for path in candidates if path.is_dir()]
+    if not existing:
+        return []
+    current_path = os.environ.get("PATH", "")
+    prefixes = [str(path) for path in existing if str(path).casefold() not in current_path.casefold()]
+    if prefixes:
+        os.environ["PATH"] = os.pathsep.join(prefixes + [current_path])
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory:
+        for path in existing:
+            try:
+                _NVIDIA_DLL_HANDLES.append(add_dll_directory(str(path)))
+            except OSError:
+                pass
+    return existing
+
+
+activate_bundled_nvidia_libraries()
 
 
 class ASRUnavailable(RuntimeError):
