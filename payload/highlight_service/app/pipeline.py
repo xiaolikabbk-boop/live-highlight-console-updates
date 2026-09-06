@@ -230,6 +230,21 @@ class SegmentWatcher:
         if any(item.name > path.name for item in siblings):
             return True
 
+        # A console can be closed while the standalone recorder keeps running.
+        # If that recording ends before the console comes back, its final file
+        # has no successor and the room may be live again by the next scan.
+        # In that case the old logic held the file forever.  Only release a
+        # genuinely old file here; the exclusive-read check in ``scan_once``
+        # still protects a file that is open in the recorder.
+        historical_age = max(
+            900.0,
+            float(self.settings.recorder_segment_seconds) + max(
+                60.0, float(self.settings.stopped_segment_stable_seconds),
+            ),
+        )
+        if time.time() - stat.st_mtime >= historical_age:
+            return True
+
         room = self.db.one(
             "SELECT enabled,live_status,live_checked_at FROM live_rooms WHERE name=? AND archived=0",
             (path.parent.name,),

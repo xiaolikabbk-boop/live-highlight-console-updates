@@ -45,9 +45,27 @@ try {
     $env:HF_HOME = Join-Path $ServiceRoot "data\models"
     Push-Location $ServiceRoot
     $Pushed = $true
+    # Do not open a browser on a fixed timer: on a cold start the server can
+    # take longer than three seconds, which leaves the user on a misleading
+    # "connection refused" page.  Wait until the local server answers first.
+    $BrowserWaitCommand = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$address = 'http://127.0.0.1:8876/'
+for ($attempt = 0; $attempt -lt 45; $attempt++) {
+    try {
+        $request = [Net.WebRequest]::Create($address)
+        $request.Timeout = 1000
+        $response = $request.GetResponse()
+        $response.Close()
+        Start-Process $address
+        exit 0
+    }
+    catch { Start-Sleep -Seconds 1 }
+}
+Start-Process $address
+'@.Trim()
     Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
-        "-NoLogo", "-NoProfile", "-Command",
-        "Start-Sleep -Seconds 3; Start-Process 'http://127.0.0.1:8876'"
+        "-NoLogo", "-NoProfile", "-Command", $BrowserWaitCommand
     )
     Write-Host "Starting the console at http://127.0.0.1:8876 ..." -ForegroundColor Green
     & $PythonExe -m app.main
