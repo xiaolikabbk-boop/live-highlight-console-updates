@@ -141,7 +141,10 @@ class MediaTools:
         destination.parent.mkdir(parents=True, exist_ok=True)
         self._run([
             str(self.settings.ffmpeg_path), "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            # Decoding audio does not benefit from consuming every CPU core;
+            # Whisper runs on CUDA, so reserve most of the CPU for the user,
+            # recorder and the rest of the console while a backlog is cleared.
+            "-threads", "2", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
             str(destination),
         ])
         return destination

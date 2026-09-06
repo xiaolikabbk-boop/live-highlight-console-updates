@@ -44,10 +44,15 @@ class WhisperTranscriber:
                     self.runtime = "cpu:int8_fallback"
             return self._model
 
-    def transcribe(self, audio_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def transcribe(self, audio_path: Path, *, fast_backlog: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         model = self._get_model()
+        # Beam five is retained for ordinary live processing.  When a large
+        # historical queue exists, beam three is materially faster on CUDA yet
+        # still keeps word timestamps and VAD, so downstream review remains
+        # unchanged.  The pipeline switches back automatically once caught up.
+        beam_size = 3 if fast_backlog else 5
         try:
-            segments, info = self._transcribe_with_model(model, audio_path)
+            segments, info = self._transcribe_with_model(model, audio_path, beam_size=beam_size)
             materialized = list(segments)
         except (RuntimeError, OSError) as exc:
             message = str(exc).lower()
@@ -58,7 +63,7 @@ class WhisperTranscriber:
             with self._lock:
                 self._model = WhisperModel(self.settings.whisper_model, device="cpu", compute_type="int8")
                 self.runtime = "cpu:int8_fallback"
-            segments, info = self._transcribe_with_model(self._model, audio_path)
+            segments, info = self._transcribe_with_model(self._model, audio_path, beam_size=beam_size)
             materialized = list(segments)
         rows: list[dict[str, Any]] = []
         for segment in materialized:
@@ -84,15 +89,16 @@ class WhisperTranscriber:
             "language": getattr(info, "language", "zh"),
             "language_probability": float(getattr(info, "language_probability", 0) or 0),
             "duration": float(getattr(info, "duration", 0) or 0),
+            "fast_backlog": fast_backlog,
         }
         return rows, metadata
 
     @staticmethod
-    def _transcribe_with_model(model: Any, audio_path: Path) -> tuple[Any, Any]:
+    def _transcribe_with_model(model: Any, audio_path: Path, *, beam_size: int) -> tuple[Any, Any]:
         return model.transcribe(
             str(audio_path),
             language="zh",
-            beam_size=5,
+            beam_size=beam_size,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 450},
             word_timestamps=True,

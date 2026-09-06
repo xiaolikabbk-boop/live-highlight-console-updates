@@ -643,6 +643,7 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             "last": (db.one("SELECT MAX(transcribed_at) AS value FROM recording_segments") or {}).get("value", ""),
             "noun": "分片",
+            "runtime": pipeline.transcriber.runtime,
         },
         {
             "key": "ai", "title": f"多模型分析 · {ai_routes['worker_count']}路", "waiting": int(totals["waiting_ai"]),
@@ -723,13 +724,21 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
                 item["current"] = "；".join(descriptions)
                 fallback = f"；备用 {ai_routes['fallback_model']}" if ai_routes["fallback_model"] else ""
                 item["hint"] = f"{ai_routes['route_summary']}{fallback}；单线失败会自动换线并保留任务"
+            elif spec["key"] == "asr":
+                runtime = str(spec.get("runtime") or "not_loaded")
+                acceleration = "GPU 加速" if runtime.startswith("cuda") else ("CPU 回退" if runtime.startswith("cpu") else "等待首次转写")
+                mode = "积压高速模式（beam 3）" if int(spec["waiting"]) >= 30 else "常规精度模式（beam 5）"
+                item["hint"] = f"{acceleration} · {runtime}；{mode}；音频解码已限制为 2 个 CPU 线程"
             item["elapsed"] = _elapsed_text(elapsed)
             if elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能卡住", hint="单项运行时间明显过长，建议查看任务管理器或错误日志")
             elif elapsed >= spec["warn"]:
                 item.update(state="slow", state_label="处理较慢", hint="任务仍在运行，可继续观察CPU和队列变化")
             else:
-                item.update(state="working", state_label="正常处理中", hint="检测到当前任务，处理线程正在工作")
+                item.update(
+                    state="working", state_label="正常处理中",
+                    hint=item.get("hint") if spec["key"] == "asr" else "检测到当前任务，处理线程正在工作",
+                )
                 if spec["key"] == "render":
                     item["hint"] = f"实际编码器 {renderer['encoder']}；{renderer['note']}"
         elif spec["waiting"]:
@@ -746,7 +755,13 @@ def processing_health(totals: dict[str, Any]) -> list[dict[str, Any]]:
             if last_elapsed is not None and last_elapsed >= spec["danger"]:
                 item.update(state="stalled", state_label="可能停滞", current="有任务积压，但当前未检测到处理项", hint="最近完成时间较久，建议刷新后继续观察或查看运行日志")
             else:
-                item.update(state="waiting", state_label="等待调度", current="正在准备领取下一项", hint="队列存在任务，短暂没有当前项属于正常切换")
+                hint = "队列存在任务，短暂没有当前项属于正常切换"
+                if spec["key"] == "asr":
+                    runtime = str(spec.get("runtime") or "not_loaded")
+                    acceleration = "GPU 加速" if runtime.startswith("cuda") else ("CPU 回退" if runtime.startswith("cpu") else "等待首次转写")
+                    mode = "积压高速模式（beam 3）" if int(spec["waiting"]) >= 30 else "常规精度模式（beam 5）"
+                    hint = f"{acceleration} · {runtime}；{mode}；音频解码已限制为 2 个 CPU 线程"
+                item.update(state="waiting", state_label="等待调度", current="正在准备领取下一项", hint=hint)
         result.append(item)
     return result
 

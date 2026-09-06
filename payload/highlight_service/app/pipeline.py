@@ -879,7 +879,14 @@ class HighlightPipeline:
         try:
             self.db.update_segment_status(segment_id, "transcribing")
             self.media.extract_audio(path, audio_path)
-            transcript, metadata = self.transcriber.transcribe(audio_path)
+            # While catching up, trade a small amount of beam-search depth for
+            # a substantial CUDA throughput gain.  This mode turns itself off
+            # before the regular live queue becomes small again.
+            pending = self.db.one(
+                "SELECT COUNT(*) AS count FROM recording_segments WHERE status='discovered'"
+            ) or {}
+            fast_backlog = int(pending.get("count") or 0) >= 30
+            transcript, metadata = self.transcriber.transcribe(audio_path, fast_backlog=fast_backlog)
             timeline_start = float(segment["timeline_start"])
             rows = []
             for span in transcript:
