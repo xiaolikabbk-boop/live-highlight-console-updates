@@ -275,7 +275,31 @@ def candidate_download_filename(candidate: dict[str, Any]) -> str:
     return f"{candidate_room_file_prefix(candidate)}_{candidate_local_date(candidate, True)}_素材{int(candidate['id']):04d}.mp4"
 
 
-def active_recording_state(room: dict[str, Any]) -> dict[str, Any]:
+def latest_recordings_by_room() -> dict[str, tuple[Path, os.stat_result]]:
+    """Scan the recording tree once and retain the newest media file per room."""
+    latest: dict[str, tuple[Path, os.stat_result]] = {}
+    try:
+        paths = settings.input_dir.rglob("*")
+        for path in paths:
+            try:
+                if not path.is_file() or path.suffix.lower() not in {".ts", ".mp4", ".mkv", ".flv"}:
+                    continue
+                stat = path.stat()
+                room_key = safe_id(path.parent.name)
+                previous = latest.get(room_key)
+                if previous is None or stat.st_mtime > previous[1].st_mtime:
+                    latest[room_key] = (path, stat)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return latest
+
+
+def active_recording_state(
+    room: dict[str, Any],
+    latest_by_room: dict[str, tuple[Path, os.stat_result]] | None = None,
+) -> dict[str, Any]:
     result = {
         "recording_active": False,
         "active_file": "",
@@ -288,17 +312,11 @@ def active_recording_state(room: dict[str, Any]) -> dict[str, Any]:
     }
     try:
         room_key = str(room.get("source_key") or safe_id(room["name"]))
-        latest = max(
-            (path for path in settings.input_dir.rglob("*")
-             if path.is_file()
-             and path.suffix.lower() in {".ts", ".mp4", ".mkv", ".flv"}
-             and safe_id(path.parent.name) == room_key),
-            key=lambda path: path.stat().st_mtime,
-            default=None,
-        )
-        if latest is None:
+        recordings = latest_by_room if latest_by_room is not None else latest_recordings_by_room()
+        latest_entry = recordings.get(room_key)
+        if latest_entry is None:
             return result
-        stat = latest.stat()
+        latest, stat = latest_entry
         now_ts = datetime.now().timestamp()
         elapsed = max(0.0, now_ts - stat.st_ctime)
         fresh = now_ts - stat.st_mtime < 45
@@ -318,10 +336,16 @@ def active_recording_state(room: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def room_processing_state(room: dict[str, Any]) -> tuple[str, str]:
-    counts = {row["status"]: int(row["count"]) for row in db.all(
-        "SELECT status,COUNT(*) AS count FROM recording_segments WHERE room_id=? AND status<>'cleaned' GROUP BY status", (room["id"],)
-    )}
+def room_processing_state(
+    room: dict[str, Any],
+    counts_by_room: dict[int, dict[str, int]] | None = None,
+) -> tuple[str, str]:
+    if counts_by_room is None:
+        counts = {row["status"]: int(row["count"]) for row in db.all(
+            "SELECT status,COUNT(*) AS count FROM recording_segments WHERE room_id=? AND status<>'cleaned' GROUP BY status", (room["id"],)
+        )}
+    else:
+        counts = counts_by_room.get(int(room["id"]), {})
     for status, key, label in (
         ("awaiting_finalization", "queued", "等待录像封口"),
         ("transcribing", "transcribing", "转写中"),
@@ -344,6 +368,13 @@ def room_processing_state(room: dict[str, Any]) -> tuple[str, str]:
 
 
 def room_cards() -> list[dict[str, Any]]:
+    latest_by_room = latest_recordings_by_room()
+    processing_counts: dict[int, dict[str, int]] = {}
+    for count_row in db.all(
+        "SELECT room_id,status,COUNT(*) AS count FROM recording_segments "
+        "WHERE room_id IS NOT NULL AND status<>'cleaned' GROUP BY room_id,status"
+    ):
+        processing_counts.setdefault(int(count_row["room_id"]), {})[count_row["status"]] = int(count_row["count"])
     rows = db.all(
         """SELECT r.*,
            (SELECT COUNT(*) FROM recording_segments s WHERE s.room_id=r.id
@@ -379,14 +410,14 @@ def room_cards() -> list[dict[str, Any]]:
     )
     for row in rows:
         row["live_state"], row["live_label"] = room_live_state(row)
-        row.update(active_recording_state(row))
+        row.update(active_recording_state(row, latest_by_room))
         if row["recording_active"]:
             row["recording_state"], row["recording_label"] = "active", "正在录制"
         elif row.get("enabled"):
             row["recording_state"], row["recording_label"] = "enabled", "录制已开"
         else:
             row["recording_state"], row["recording_label"] = "paused", "录制暂停"
-        row["processing_state"], row["processing_label"] = room_processing_state(row)
+        row["processing_state"], row["processing_label"] = room_processing_state(row, processing_counts)
         row["state"] = row["processing_label"]
         row["effective_count"] = int(row["accepted_count"]) + int(row["exported_count"])
     return rows
@@ -1009,7 +1040,6 @@ def shutdown_workbench(payload: WebUpdateRequest) -> dict[str, Any]:
 
 @app.get("/", response_class=HTMLResponse)
 def control_center(request: Request) -> HTMLResponse:
-    cleanup_expired_candidate_media()
     cards = room_cards()
     totals = {
         "rooms": len(cards),
@@ -1050,7 +1080,6 @@ def control_center(request: Request) -> HTMLResponse:
 @app.get("/review", response_class=HTMLResponse)
 def dashboard(request: Request, status: str = "pending_review", room_id: str = "",
               model: str = "", output_date: str = "") -> HTMLResponse:
-    cleanup_expired_candidate_media()
     selected_room_id = optional_query_int(room_id, "直播间")
     conditions: list[str] = []
     params: list[Any] = []
@@ -1096,7 +1125,6 @@ def dashboard(request: Request, status: str = "pending_review", room_id: str = "
 def export_center(request: Request, status: str = "accepted", room_id: str = "", source_id: str = "",
                   model: str = "", output_date: str = "", export_date: str = "",
                   date_scope: str = "") -> HTMLResponse:
-    cleanup_expired_candidate_media()
     selected_room_id = optional_query_int(room_id, "直播间")
     selected_source_id = source_id.strip()
     if status not in {"accepted", "exported", "all"}:

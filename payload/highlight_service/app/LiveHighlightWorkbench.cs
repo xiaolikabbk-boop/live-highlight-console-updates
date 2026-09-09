@@ -153,6 +153,8 @@ internal sealed class WorkbenchForm : Form
     private readonly ProgressBar progressBar;
     private readonly Timer readyTimer;
     private Process backendProcess;
+    private WebView2 browser;
+    private Label navigationStatus;
     private int attempts;
 
     internal WorkbenchForm(string root)
@@ -163,6 +165,8 @@ internal sealed class WorkbenchForm : Form
         WindowState = FormWindowState.Maximized;
         MinimumSize = new Size(1000, 680);
         BackColor = Color.FromArgb(244, 240, 255);
+        KeyPreview = true;
+        KeyDown += HandleRefreshShortcut;
 
         Panel splash = new Panel();
         splash.Name = "startupSplash";
@@ -248,7 +252,7 @@ internal sealed class WorkbenchForm : Form
     {
         try
         {
-            WebView2 browser = new WebView2();
+            browser = new WebView2();
             browser.Dock = DockStyle.Fill;
             string legacyRoot = LiveHighlightWorkbench.GetSelectedLegacyRoot(rootDirectory);
             string activeRoot = string.IsNullOrEmpty(legacyRoot) ? rootDirectory : legacyRoot;
@@ -258,10 +262,23 @@ internal sealed class WorkbenchForm : Form
             browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
             browser.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             browser.CoreWebView2.Settings.IsStatusBarEnabled = false;
+            browser.CoreWebView2.NavigationStarting += delegate { BeginInvoke((Action)(() => navigationStatus.Text = "正在加载…")); };
+            browser.CoreWebView2.NavigationCompleted += delegate { BeginInvoke((Action)(() => navigationStatus.Text = "每30秒自动更新")); };
+
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.RowCount = 2;
+            layout.ColumnCount = 1;
+            layout.Margin = Padding.Empty;
+            layout.Padding = Padding.Empty;
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            layout.Controls.Add(CreateDesktopToolbar(), 0, 0);
+            layout.Controls.Add(browser, 0, 1);
+
             browser.Source = new Uri(LiveHighlightWorkbench.Address);
             Controls.Clear();
-            Controls.Add(browser);
-            AddDesktopToolbar();
+            Controls.Add(layout);
             browser.Focus();
         }
         catch (Exception exception)
@@ -270,7 +287,7 @@ internal sealed class WorkbenchForm : Form
         }
     }
 
-    private void AddDesktopToolbar()
+    private Panel CreateDesktopToolbar()
     {
         Panel toolbar = new Panel();
         toolbar.Dock = DockStyle.Top;
@@ -285,19 +302,58 @@ internal sealed class WorkbenchForm : Form
         desktopTitle.Location = new Point(16, 11);
         toolbar.Controls.Add(desktopTitle);
 
+        navigationStatus = new Label();
+        navigationStatus.Text = "每30秒自动更新";
+        navigationStatus.ForeColor = Color.FromArgb(220, 210, 248);
+        navigationStatus.Font = new Font("Microsoft YaHei UI", 9F);
+        navigationStatus.AutoSize = true;
+        navigationStatus.Location = new Point(210, 12);
+        toolbar.Controls.Add(navigationStatus);
+
+        FlowLayoutPanel actions = new FlowLayoutPanel();
+        actions.Dock = DockStyle.Right;
+        actions.Width = 226;
+        actions.FlowDirection = FlowDirection.LeftToRight;
+        actions.WrapContents = false;
+        actions.Padding = new Padding(0, 5, 8, 0);
+        actions.BackColor = Color.Transparent;
+
+        Button refresh = new Button();
+        refresh.Text = "刷新";
+        refresh.Size = new Size(82, 29);
+        refresh.FlatStyle = FlatStyle.Flat;
+        refresh.FlatAppearance.BorderColor = Color.FromArgb(190, 170, 240);
+        refresh.ForeColor = Color.White;
+        refresh.BackColor = Color.FromArgb(105, 67, 194);
+        refresh.Click += delegate { ReloadWorkbench(); };
+        actions.Controls.Add(refresh);
+
         Button migrate = new Button();
         migrate.Text = "接入旧版数据";
         migrate.Size = new Size(120, 29);
-        migrate.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         migrate.FlatStyle = FlatStyle.Flat;
         migrate.FlatAppearance.BorderColor = Color.FromArgb(190, 170, 240);
         migrate.ForeColor = Color.White;
         migrate.BackColor = Color.FromArgb(105, 67, 194);
-        migrate.Location = new Point(ClientSize.Width - 136, 6);
         migrate.Click += ChooseLegacyData;
-        toolbar.Controls.Add(migrate);
-        Controls.Add(toolbar);
-        toolbar.BringToFront();
+        actions.Controls.Add(migrate);
+        toolbar.Controls.Add(actions);
+        return toolbar;
+    }
+
+    private void ReloadWorkbench()
+    {
+        if (browser == null || browser.CoreWebView2 == null) return;
+        navigationStatus.Text = "正在刷新…";
+        browser.Reload();
+    }
+
+    private void HandleRefreshShortcut(object sender, KeyEventArgs e)
+    {
+        if (e.KeyCode != Keys.F5 && !(e.Control && e.KeyCode == Keys.R)) return;
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+        ReloadWorkbench();
     }
 
     private async void ChooseLegacyData(object sender, EventArgs e)
