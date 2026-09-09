@@ -16,7 +16,7 @@ $BackupDir = $null
 $State = $null
 
 function Start-WorkbenchBackground {
-    $launcher = Join-Path $Root 'highlight_service\app\直播高光工作台.exe'
+    $launcher = Join-Path $Root 'highlight_service\app\LiveHighlightWorkbench.exe'
     Start-Process -FilePath $launcher -WindowStyle Hidden -WorkingDirectory $Root -ArgumentList @('background')
 }
 

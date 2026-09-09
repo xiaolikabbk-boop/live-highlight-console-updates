@@ -7,7 +7,7 @@ $PythonExe = Join-Path $Root "runtime\python.exe"
 $InstallMarker = Join-Path $Root "runtime\.install_complete"
 $ErrorLog = Join-Path $Root "startup-error.log"
 $RestartMarker = Join-Path $Root "_workbench-restart-requested"
-$DesktopLauncher = Join-Path $ServiceRoot "app\直播高光工作台.exe"
+$DesktopLauncher = Join-Path $ServiceRoot "app\LiveHighlightWorkbench.exe"
 $Address = "http://127.0.0.1:8876/"
 $Pushed = $false
 
