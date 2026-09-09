@@ -181,6 +181,19 @@ class RecorderSupervisor:
     def start(self) -> None:
         if not self.settings.recorder_auto_start:
             return
+        # One-time transition for installations upgraded from the console
+        # edition: replace its already-running visible recorder with the new
+        # background process. The current media file becomes a normal completed
+        # segment and is recovered by SegmentWatcher.
+        background_marker = self.settings.data_dir / ".background_recorder_v1"
+        if os.name == "nt" and not background_marker.exists():
+            try:
+                if self.running:
+                    self.stop_running()
+                background_marker.write_text("background recorder enabled\n", encoding="utf-8")
+                self.db.event("info", "desktop_migration", "旧版录制器已迁移为后台运行模式")
+            except OSError as exc:
+                self.db.event("warning", "desktop_migration", f"录制器后台迁移将在下次启动重试：{exc}")
         self.ensure_running()
         self._thread = threading.Thread(target=self._loop, name="recorder-supervisor", daemon=True)
         self._thread.start()
