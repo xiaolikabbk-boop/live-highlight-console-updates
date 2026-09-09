@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -30,6 +31,12 @@ internal static class LiveHighlightWorkbench
                 string runtimeVersion = CoreWebView2Environment.GetAvailableBrowserVersionString();
                 if (string.IsNullOrWhiteSpace(runtimeVersion)) return 2;
                 using (WebView2 probe = new WebView2()) { }
+                TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
+                listener.Start();
+                int testPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+                bool socketReady = IsPortReady(testPort);
+                listener.Stop();
+                if (!socketReady) return 4;
                 return 0;
             }
             catch { return 3; }
@@ -109,16 +116,21 @@ internal static class LiveHighlightWorkbench
 
     internal static bool IsReady()
     {
+        return IsPortReady(8876);
+    }
+
+    internal static bool IsPortReady(int port)
+    {
+        TcpClient client = new TcpClient();
         try
         {
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(Address);
-            request.Timeout = 800;
-            request.ReadWriteTimeout = 800;
-            request.Proxy = null;
-            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-                return (int)response.StatusCode >= 200 && (int)response.StatusCode < 500;
+            IAsyncResult pending = client.BeginConnect(IPAddress.Loopback, port, null, null);
+            if (!pending.AsyncWaitHandle.WaitOne(1000)) return false;
+            client.EndConnect(pending);
+            return client.Connected;
         }
         catch { return false; }
+        finally { client.Close(); }
     }
 
     internal static string WriteLauncherError(string rootDirectory, Exception exception)
