@@ -15,6 +15,15 @@ $WorkDir = $null
 $BackupDir = $null
 $State = $null
 
+function Start-WorkbenchBackground {
+    $script = Join-Path $Root 'start_console.ps1'
+    $quotedScript = '"' + $script + '"'
+    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -WorkingDirectory $Root -ArgumentList @(
+        '-NoLogo', '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+        '-File', $quotedScript, '-NoDesktopWindow'
+    )
+}
+
 function Set-WebUpdateStatus([string]$Status, [string]$Message, [string]$Version = "") {
     if (-not $WebInstall) { return }
     New-Item -ItemType Directory -Path $UpdateRoot -Force | Out-Null
@@ -211,7 +220,7 @@ catch {
     Set-WebUpdateStatus "failed" $_.Exception.Message $CurrentText
     if ($WebInstall -and $ServiceStopped) {
         Remove-Item -LiteralPath $WebMarker -Force -ErrorAction SilentlyContinue
-        Start-Process -FilePath (Join-Path $Root '启动直播录制剪辑中控台.bat') -WorkingDirectory $Root
+        Start-WorkbenchBackground
     }
     throw
 }
@@ -220,5 +229,5 @@ finally {
 }
 if ($WebInstall) {
     Remove-Item -LiteralPath $WebMarker -Force -ErrorAction SilentlyContinue
-    Start-Process -FilePath (Join-Path $Root '启动直播录制剪辑中控台.bat') -WorkingDirectory $Root
+    Start-WorkbenchBackground
 }

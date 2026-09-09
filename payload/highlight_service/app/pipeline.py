@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -106,7 +108,13 @@ class RecorderSupervisor:
         if not self.settings.recorder_exe_path.exists():
             self.db.event("error", "recorder", "没有找到 DouyinLiveRecorder.exe")
             return False
-        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        # Keep the recorder as a background service. Its health and recent
+        # activity are exposed in the desktop dashboard, so a permanent second
+        # console window is no longer needed.
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
         subprocess.Popen(
             [str(self.settings.recorder_exe_path)],
             cwd=str(self.settings.recorder_root),
@@ -115,6 +123,42 @@ class RecorderSupervisor:
         self._config_restart_required = False
         self.db.event("info", "recorder", "已自动启动直播录制器")
         return True
+
+    def restart_for_config(self) -> dict[str, Any]:
+        """Apply the saved room list without asking users to find a console window."""
+        stopped = self.stop_running()
+        self._config_restart_required = False
+        running = self.ensure_running()
+        self.db.event(
+            "info", "recorder_restart",
+            "已从桌面工作台应用最新直播间名单并重启后台录制服务",
+            {"stopped_processes": stopped, "running": running},
+        )
+        return {"stopped_processes": stopped, "running": running}
+
+    def stop_running(self) -> int:
+        """Stop recorder process groups after an explicit desktop action."""
+        process_ids = self._recorder_process_ids()
+        stopped = 0
+        for process_id in process_ids:
+            try:
+                # The recorder is started as a process group. CTRL_BREAK gives
+                # it a chance to finish the current media file cleanly.
+                os.kill(process_id, signal.CTRL_BREAK_EVENT)
+                stopped += 1
+            except (OSError, ValueError):
+                subprocess.run(
+                    ["taskkill.exe", "/PID", str(process_id), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    check=False,
+                )
+                stopped += 1
+        deadline = time.monotonic() + 8
+        while self._recorder_process_ids() and time.monotonic() < deadline:
+            time.sleep(.25)
+        return stopped
 
     @property
     def config_restart_required(self) -> bool:

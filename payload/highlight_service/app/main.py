@@ -8,8 +8,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import zipfile
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -26,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .config import settings
+from .ai import OpenAICompatibleClient
 from .db import Database, json_field, utc_now
 from .guardian import Guardian
 from .media import MediaError, MediaTools, evenly_timed_captions
@@ -791,6 +795,24 @@ class WebUpdateRequest(BaseModel):
     confirm: bool = False
 
 
+class ModelSettingsSaveRequest(BaseModel):
+    relay_base_url: str = ""
+    relay_plus_api_key: str = ""
+    relay_pro_api_key: str = ""
+    relay_plus_models: str = ""
+    relay_pro_models: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_api_key: str = ""
+    deepseek_model: Literal["deepseek-v4-flash", "deepseek-v4-pro"] = "deepseek-v4-flash"
+
+
+class ModelConnectionTestRequest(BaseModel):
+    provider: Literal["plus", "pro", "deepseek"]
+    base_url: str
+    api_key: str = ""
+    model: str
+
+
 @app.get("/api/update/status")
 def web_update_status() -> dict[str, Any]:
     return github_update_status()
@@ -845,6 +867,144 @@ def web_update_install(payload: WebUpdateRequest) -> dict[str, Any]:
         "available_version": status["available_version"],
         "message": "安全更新程序已启动；完成后中控台会自动重启",
     }
+
+
+@app.post("/api/recorder/restart")
+def restart_recorder(payload: WebUpdateRequest) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(422, "必须明确确认后才能重启后台录制服务")
+    result = pipeline.recorder.restart_for_config()
+    return {
+        "ok": True,
+        **result,
+        "message": "最新直播间名单已应用，后台录制服务已重新启动" if result["running"]
+        else "最新直播间名单已应用；当前没有启用的直播间，录制服务保持待机",
+    }
+
+
+def _write_env_values(path: Path, values: dict[str, str]) -> None:
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = existing.splitlines()
+    pending = dict(values)
+    output: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            output.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in pending:
+            output.append(f"{key}={pending.pop(key)}")
+        else:
+            output.append(line)
+    if pending:
+        if output and output[-1]:
+            output.append("")
+        output.append("# ===== 桌面工作台模型设置 =====")
+        output.extend(f"{key}={value}" for key, value in pending.items())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+@app.get("/api/settings/models")
+def model_settings_status() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "relay_base_url": settings.ai_base_url,
+        "relay_plus_configured": bool(settings.relay_plus_api_key or settings.ai_api_key),
+        "relay_pro_configured": bool(settings.relay_pro_api_key or settings.ai_secondary_api_key),
+        "relay_plus_models": settings.relay_plus_models or settings.relay_plus_model,
+        "relay_pro_models": settings.relay_pro_models or settings.relay_pro_model,
+        "deepseek_base_url": settings.deepseek_base_url,
+        "deepseek_configured": bool(settings.deepseek_api_key),
+        "deepseek_model": settings.deepseek_model,
+        "data_dir": str(settings.data_dir),
+        "message": "密钥已安全保存" if any((settings.relay_plus_api_key, settings.relay_pro_api_key, settings.deepseek_api_key)) else "尚未填写模型密钥",
+    }
+
+
+@app.post("/api/settings/models/test")
+def test_model_connection(payload: ModelConnectionTestRequest) -> dict[str, Any]:
+    base_url = payload.base_url.strip().rstrip("/")
+    model = payload.model.split(",", 1)[0].strip()
+    saved_keys = {
+        "plus": settings.relay_plus_api_key or settings.ai_api_key,
+        "pro": settings.relay_pro_api_key or settings.ai_secondary_api_key,
+        "deepseek": settings.deepseek_api_key,
+    }
+    api_key = payload.api_key.strip() or saved_keys[payload.provider]
+    if not base_url or not api_key or not model:
+        raise HTTPException(422, "请先填写接口地址、密钥和模型名称")
+    protocol = "chat" if payload.provider == "deepseek" else "auto"
+    test_settings = replace(
+        settings, ai_base_url=base_url, ai_api_key=api_key, ai_model=model,
+        ai_protocol=protocol, ai_thinking_mode="disabled", ai_max_attempts=1,
+        ai_timeout_seconds=30, ai_max_output_tokens=120, ai_vision_enabled=False,
+    )
+    started = time.monotonic()
+    try:
+        result = OpenAICompatibleClient(test_settings)._json_request([
+            {"role": "system", "content": "只返回JSON，不要解释。"},
+            {"role": "user", "content": '{"任务":"连接测试","要求":"返回 {\\"ok\\":true}"}'},
+        ])
+    except Exception as exc:
+        raise HTTPException(502, f"连接测试失败：{str(exc)[:240]}") from exc
+    if result.get("ok") is not True:
+        raise HTTPException(502, "线路可以响应，但没有按要求返回测试结果")
+    return {"ok": True, "model": model, "elapsed_seconds": round(time.monotonic() - started, 2), "message": f"{model} 连接正常"}
+
+
+@app.post("/api/settings/models")
+def save_model_settings(payload: ModelSettingsSaveRequest) -> dict[str, Any]:
+    values = {
+        "HIGHLIGHT_AI_BASE_URL": payload.relay_base_url.strip().rstrip("/"),
+        "HIGHLIGHT_RELAY_PLUS_MODELS": payload.relay_plus_models.strip(),
+        "HIGHLIGHT_RELAY_PRO_MODELS": payload.relay_pro_models.strip(),
+        "HIGHLIGHT_DEEPSEEK_BASE_URL": payload.deepseek_base_url.strip().rstrip("/"),
+        "HIGHLIGHT_DEEPSEEK_MODEL": payload.deepseek_model,
+    }
+    # Blank password fields deliberately preserve the existing secret.
+    if payload.relay_plus_api_key.strip():
+        values["HIGHLIGHT_RELAY_PLUS_API_KEY"] = payload.relay_plus_api_key.strip()
+    if payload.relay_pro_api_key.strip():
+        values["HIGHLIGHT_RELAY_PRO_API_KEY"] = payload.relay_pro_api_key.strip()
+    if payload.deepseek_api_key.strip():
+        values["HIGHLIGHT_DEEPSEEK_API_KEY"] = payload.deepseek_api_key.strip()
+    if any("\n" in value or "\r" in value for value in values.values()):
+        raise HTTPException(422, "模型设置中不能包含换行符")
+    if not values["HIGHLIGHT_AI_BASE_URL"] or not values["HIGHLIGHT_DEEPSEEK_BASE_URL"]:
+        raise HTTPException(422, "模型接口地址不能为空")
+    _write_env_values(settings.service_root / ".env", values)
+    return {"ok": True, "restart_required": True, "message": "模型设置已保存，正在重启后台服务使其生效"}
+
+
+@app.post("/api/system/restart")
+def restart_workbench(payload: WebUpdateRequest) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(422, "必须明确确认后才能重启后台服务")
+    marker = settings.service_root.parent / "_workbench-restart-requested"
+    marker.write_text(str(os.getpid()), encoding="ascii")
+    def exit_later() -> None:
+        time.sleep(1.2)
+        os._exit(0)
+    threading.Thread(target=exit_later, name="workbench-restart", daemon=True).start()
+    return {"ok": True, "message": "后台服务正在重启，工作台会自动恢复"}
+
+
+@app.post("/api/system/shutdown")
+def shutdown_workbench(payload: WebUpdateRequest) -> dict[str, Any]:
+    if not payload.confirm:
+        raise HTTPException(422, "必须明确确认后才能退出后台服务")
+    def stop_later() -> None:
+        time.sleep(.8)
+        try:
+            pipeline.recorder.stop_running()
+        finally:
+            os._exit(0)
+    threading.Thread(target=stop_later, name="workbench-shutdown", daemon=True).start()
+    return {"ok": True, "message": "正在停止录制和后台处理；所有数据均已保留"}
 
 
 @app.get("/", response_class=HTMLResponse)
