@@ -1,4 +1,4 @@
 @echo off
 setlocal
-wscript.exe //nologo "%~dp0highlight_service\app\launch_workbench.vbs"
+start "" "%~dp0highlight_service\app\直播高光工作台.exe"
 exit /b 0

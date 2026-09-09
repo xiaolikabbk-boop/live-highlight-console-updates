@@ -16,10 +16,8 @@ $BackupDir = $null
 $State = $null
 
 function Start-WorkbenchBackground {
-    $launcher = Join-Path $Root 'highlight_service\app\launch_workbench.vbs'
-    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -WindowStyle Hidden -WorkingDirectory $Root -ArgumentList @(
-        '//nologo', ('"' + $launcher + '"'), 'background'
-    )
+    $launcher = Join-Path $Root 'highlight_service\app\直播高光工作台.exe'
+    Start-Process -FilePath $launcher -WindowStyle Hidden -WorkingDirectory $Root -ArgumentList @('background')
 }
 
 function Set-WebUpdateStatus([string]$Status, [string]$Message, [string]$Version = "") {

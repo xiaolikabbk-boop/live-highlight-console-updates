@@ -8,7 +8,8 @@ from pathlib import Path
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = SERVICE_ROOT.parent
-RECORDER_ROOT = WORKSPACE_ROOT / "DouyinLiveRecorder_v4.0.7"
+RECORDER_ROOT = Path(os.environ.get("HIGHLIGHT_RECORDER_ROOT") or (WORKSPACE_ROOT / "DouyinLiveRecorder_v4.0.7"))
+DATA_ROOT = Path(os.environ.get("HIGHLIGHT_DATA_DIR") or (SERVICE_ROOT / "data"))
 
 
 def _load_dotenv(path: Path) -> None:
@@ -30,11 +31,11 @@ class Settings:
     service_root: Path = SERVICE_ROOT
     recorder_root: Path = RECORDER_ROOT
     input_dir: Path = RECORDER_ROOT / "downloads"
-    data_dir: Path = SERVICE_ROOT / "data"
-    cache_dir: Path = SERVICE_ROOT / "data" / "cache"
-    output_dir: Path = SERVICE_ROOT / "data" / "outputs"
-    keyframe_dir: Path = SERVICE_ROOT / "data" / "keyframes"
-    db_path: Path = SERVICE_ROOT / "data" / "highlight.db"
+    data_dir: Path = DATA_ROOT
+    cache_dir: Path = DATA_ROOT / "cache"
+    output_dir: Path = DATA_ROOT / "outputs"
+    keyframe_dir: Path = DATA_ROOT / "keyframes"
+    db_path: Path = DATA_ROOT / "highlight.db"
     ffmpeg_path: Path = RECORDER_ROOT / "ffmpeg" / "ffmpeg.exe"
     ffprobe_path: Path = RECORDER_ROOT / "ffmpeg" / "ffprobe.exe"
     recorder_exe_path: Path = RECORDER_ROOT / "DouyinLiveRecorder.exe"

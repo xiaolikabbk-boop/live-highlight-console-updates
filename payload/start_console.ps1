@@ -7,7 +7,7 @@ $PythonExe = Join-Path $Root "runtime\python.exe"
 $InstallMarker = Join-Path $Root "runtime\.install_complete"
 $ErrorLog = Join-Path $Root "startup-error.log"
 $RestartMarker = Join-Path $Root "_workbench-restart-requested"
-$DesktopLauncher = Join-Path $ServiceRoot "app\launch_workbench.vbs"
+$DesktopLauncher = Join-Path $ServiceRoot "app\直播高光工作台.exe"
 $Address = "http://127.0.0.1:8876/"
 $Pushed = $false
 
@@ -46,8 +46,8 @@ function Ensure-DesktopShortcut {
         $shortcutPath = Join-Path $desktop "直播高光工作台.lnk"
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = (Join-Path $env:WINDIR "System32\wscript.exe")
-        $shortcut.Arguments = "//nologo `"$DesktopLauncher`""
+        $shortcut.TargetPath = $DesktopLauncher
+        $shortcut.Arguments = ""
         $shortcut.WorkingDirectory = $Root
         $edge = Find-EdgeExecutable
         if ($edge) { $shortcut.IconLocation = "$edge,0" }
@@ -100,19 +100,10 @@ try {
     if (Test-Path -LiteralPath $CublasBin) { $env:PATH = "$CublasBin;$env:PATH" }
     if (Test-Path -LiteralPath $CudnnBin) { $env:PATH = "$CudnnBin;$env:PATH" }
 
-    $env:HF_HOME = Join-Path $ServiceRoot "data\models"
+    $ActiveDataRoot = if ($env:HIGHLIGHT_DATA_DIR) { $env:HIGHLIGHT_DATA_DIR } else { Join-Path $ServiceRoot "data" }
+    $env:HF_HOME = Join-Path $ActiveDataRoot "models"
     Push-Location $ServiceRoot
     $Pushed = $true
-
-    # Open only after the local service responds, and use Edge app mode so the
-    # user sees one desktop-style window without tabs or an address bar.
-    if (-not $NoDesktopWindow) {
-        if (-not (Test-Path -LiteralPath $DesktopLauncher)) {
-            throw "Desktop launcher is missing. Install the latest update again."
-        }
-        $shell = New-Object -ComObject WScript.Shell
-        $shell.Run("wscript.exe //nologo `"$DesktopLauncher`" wait", 0, $false) | Out-Null
-    }
 
     do {
         if (Test-Path -LiteralPath $RestartMarker) { Remove-Item -LiteralPath $RestartMarker -Force }
