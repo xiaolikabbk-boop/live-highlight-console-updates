@@ -1,4 +1,4 @@
-param([switch]$NoDesktopWindow)
+﻿param([switch]$NoDesktopWindow)
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path

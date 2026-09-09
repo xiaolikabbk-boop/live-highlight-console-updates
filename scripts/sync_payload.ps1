@@ -22,6 +22,15 @@ foreach ($Name in $RootFiles) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "缺少发布文件：$Source" }
     Copy-Item -LiteralPath $Source -Destination (Join-Path $PayloadRoot $Name) -Force
 }
+# Windows PowerShell 5.1 treats UTF-8 without a BOM as the local ANSI code
+# page.  A multibyte Chinese string can then corrupt the parser before the
+# script's own error handler starts, so every shipped PowerShell script is
+# normalized to UTF-8 with BOM as part of the release build.
+$Utf8Bom = New-Object System.Text.UTF8Encoding($true)
+Get-ChildItem -LiteralPath $PayloadRoot -Filter '*.ps1' -File -Recurse | ForEach-Object {
+    $Text = [IO.File]::ReadAllText($_.FullName, [Text.Encoding]::UTF8)
+    [IO.File]::WriteAllText($_.FullName, $Text, $Utf8Bom)
+}
 $DistRoot = Join-Path $RepoRoot "dist"
 New-Item -ItemType Directory -Path $DistRoot -Force | Out-Null
 $ManifestFile = Join-Path $RepoRoot "update-manifest.local.json"

@@ -37,7 +37,7 @@ internal static class LiveHighlightWorkbench
 
         if (background)
         {
-            try { StartBackend(rootDirectory); return 0; }
+            try { StartBackend(rootDirectory, false); return 0; }
             catch (Exception exception) { WriteLauncherError(rootDirectory, exception); return 1; }
         }
 
@@ -60,7 +60,7 @@ internal static class LiveHighlightWorkbench
         catch { return false; }
     }
 
-    internal static Process StartBackend(string rootDirectory)
+    internal static Process StartBackend(string rootDirectory, bool captureOutput)
     {
         string progressLog = Path.Combine(rootDirectory, "startup-progress.log");
         File.WriteAllText(progressLog,
@@ -79,6 +79,8 @@ internal static class LiveHighlightWorkbench
         info.UseShellExecute = false;
         info.CreateNoWindow = true;
         info.WindowStyle = ProcessWindowStyle.Hidden;
+        info.RedirectStandardOutput = captureOutput;
+        info.RedirectStandardError = captureOutput;
         string legacyRoot = GetSelectedLegacyRoot(rootDirectory);
         if (!string.IsNullOrEmpty(legacyRoot) &&
             !string.Equals(Path.GetFullPath(legacyRoot).TrimEnd('\\'), Path.GetFullPath(rootDirectory).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
@@ -88,6 +90,20 @@ internal static class LiveHighlightWorkbench
         }
         Process process = Process.Start(info);
         if (process == null) throw new InvalidOperationException("Windows could not create the background process.");
+        if (captureOutput)
+        {
+            string backendLog = Path.Combine(rootDirectory, "backend-startup.log");
+            try { File.WriteAllText(backendLog, "", new UTF8Encoding(true)); } catch { }
+            DataReceivedEventHandler writer = delegate(object sender, DataReceivedEventArgs eventArgs)
+            {
+                if (eventArgs.Data == null) return;
+                try { File.AppendAllText(backendLog, eventArgs.Data + Environment.NewLine, new UTF8Encoding(true)); } catch { }
+            };
+            process.OutputDataReceived += writer;
+            process.ErrorDataReceived += writer;
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+        }
         return process;
     }
 
@@ -176,7 +192,7 @@ internal sealed class WorkbenchForm : Form
         try
         {
             if (!LiveHighlightWorkbench.IsReady())
-                backendProcess = LiveHighlightWorkbench.StartBackend(rootDirectory);
+                backendProcess = LiveHighlightWorkbench.StartBackend(rootDirectory, true);
             readyTimer.Start();
             CheckReady(null, EventArgs.Empty);
         }
@@ -196,9 +212,12 @@ internal sealed class WorkbenchForm : Form
         {
             readyTimer.Stop();
             string serviceLog = Path.Combine(rootDirectory, "startup-error.log");
+            string backendLog = Path.Combine(rootDirectory, "backend-startup.log");
             string detail = File.Exists(serviceLog)
                 ? File.ReadAllText(serviceLog)
-                : "后台处理引擎提前退出，代码 " + backendProcess.ExitCode + "。";
+                : (File.Exists(backendLog) && new FileInfo(backendLog).Length > 0
+                    ? File.ReadAllText(backendLog)
+                    : "后台处理引擎提前退出，代码 " + backendProcess.ExitCode + "。");
             ShowFailure(new InvalidOperationException(detail));
             return;
         }
