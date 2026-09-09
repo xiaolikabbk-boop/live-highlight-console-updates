@@ -7,6 +7,7 @@ $PythonExe = Join-Path $Root "runtime\python.exe"
 $InstallMarker = Join-Path $Root "runtime\.install_complete"
 $ErrorLog = Join-Path $Root "startup-error.log"
 $RestartMarker = Join-Path $Root "_workbench-restart-requested"
+$DesktopLauncher = Join-Path $ServiceRoot "app\launch_workbench.vbs"
 $Address = "http://127.0.0.1:8876/"
 $Pushed = $false
 
@@ -45,8 +46,8 @@ function Ensure-DesktopShortcut {
         $shortcutPath = Join-Path $desktop "直播高光工作台.lnk"
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = "powershell.exe"
-        $shortcut.Arguments = "-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Root\start_console.ps1`""
+        $shortcut.TargetPath = (Join-Path $env:WINDIR "System32\wscript.exe")
+        $shortcut.Arguments = "//nologo `"$DesktopLauncher`""
         $shortcut.WorkingDirectory = $Root
         $edge = Find-EdgeExecutable
         if ($edge) { $shortcut.IconLocation = "$edge,0" }
@@ -105,29 +106,12 @@ try {
 
     # Open only after the local service responds, and use Edge app mode so the
     # user sees one desktop-style window without tabs or an address bar.
-    $EdgeExe = Find-EdgeExecutable
-    $EscapedEdgeExe = if ($EdgeExe) { $EdgeExe.Replace("'", "''") } else { "" }
-    $DesktopWaitCommand = @"
-`$ErrorActionPreference = 'SilentlyContinue'
-`$address = '$Address'
-for (`$attempt = 0; `$attempt -lt 90; `$attempt++) {
-    try {
-        `$request = [Net.WebRequest]::Create(`$address)
-        `$request.Timeout = 1000
-        `$response = `$request.GetResponse()
-        `$response.Close()
-        if ('$EscapedEdgeExe') { Start-Process -FilePath '$EscapedEdgeExe' -ArgumentList @('--app=$Address','--start-maximized','--no-first-run') }
-        else { Start-Process `$address }
-        exit 0
-    }
-    catch { Start-Sleep -Seconds 1 }
-}
-"@.Trim()
     if (-not $NoDesktopWindow) {
-        $EncodedDesktopWaitCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($DesktopWaitCommand))
-        Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
-            "-NoLogo", "-NoProfile", "-EncodedCommand", $EncodedDesktopWaitCommand
-        )
+        if (-not (Test-Path -LiteralPath $DesktopLauncher)) {
+            throw "Desktop launcher is missing. Install the latest update again."
+        }
+        $shell = New-Object -ComObject WScript.Shell
+        $shell.Run("wscript.exe //nologo `"$DesktopLauncher`" wait", 0, $false) | Out-Null
     }
 
     do {
@@ -155,13 +139,12 @@ catch {
     ) -join [Environment]::NewLine
     Set-Content -LiteralPath $ErrorLog -Value $details -Encoding UTF8
     try {
-        Add-Type -AssemblyName PresentationFramework
-        [System.Windows.MessageBox]::Show(
+        $shell = New-Object -ComObject WScript.Shell
+        $shell.Popup(
             "直播高光工作台启动失败。`n`n$($_.Exception.Message)`n`n诊断信息已保存到：$ErrorLog",
-            "直播高光工作台", "OK", "Error"
+            0, "直播高光工作台", 16
         ) | Out-Null
-    }
-    catch { }
+    } catch { }
     exit 1
 }
 finally {

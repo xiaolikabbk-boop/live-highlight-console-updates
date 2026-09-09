@@ -1,4 +1,4 @@
 @echo off
 setlocal
-start "" powershell.exe -NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0start_console.ps1"
+wscript.exe //nologo "%~dp0highlight_service\app\launch_workbench.vbs"
 exit /b 0

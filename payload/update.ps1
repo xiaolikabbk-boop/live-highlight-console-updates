@@ -16,11 +16,9 @@ $BackupDir = $null
 $State = $null
 
 function Start-WorkbenchBackground {
-    $script = Join-Path $Root 'start_console.ps1'
-    $quotedScript = '"' + $script + '"'
-    Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -WorkingDirectory $Root -ArgumentList @(
-        '-NoLogo', '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
-        '-File', $quotedScript, '-NoDesktopWindow'
+    $launcher = Join-Path $Root 'highlight_service\app\launch_workbench.vbs'
+    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\wscript.exe') -WindowStyle Hidden -WorkingDirectory $Root -ArgumentList @(
+        '//nologo', ('"' + $launcher + '"'), 'background'
     )
 }
 
