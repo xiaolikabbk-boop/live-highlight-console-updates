@@ -437,6 +437,27 @@ def get_candidate(candidate_id: int) -> dict[str, Any]:
     return candidate_view(row)
 
 
+def get_candidates(candidate_ids: list[int]) -> list[dict[str, Any]]:
+    """Load a batch of candidates with one database round trip, preserving input order."""
+    ordered_ids = list(dict.fromkeys(int(candidate_id) for candidate_id in candidate_ids))
+    if not ordered_ids:
+        return []
+    placeholders = ",".join("?" for _ in ordered_ids)
+    rows = db.all(
+        f"""SELECT c.*, i.internal_code, i.name AS catalog_name,r.sequence AS room_sequence,r.name AS room_name,
+                   i.qianchuan_product_id, i.qianchuan_plan_id
+            FROM highlight_candidates c LEFT JOIN catalog_items i ON i.id=c.catalog_item_id
+            LEFT JOIN live_rooms r ON r.id=c.room_id
+            WHERE c.id IN ({placeholders})""",
+        ordered_ids,
+    )
+    by_id = {int(row["id"]): candidate_view(row) for row in rows}
+    missing = [candidate_id for candidate_id in ordered_ids if candidate_id not in by_id]
+    if missing:
+        raise HTTPException(404, f"候选 #{missing[0]} 不存在")
+    return [by_id[candidate_id] for candidate_id in ordered_ids]
+
+
 def ensure_publish_job(candidate: dict[str, Any]) -> dict[str, Any]:
     existing = db.one("SELECT * FROM publish_jobs WHERE candidate_id=?", (candidate["id"],))
     complete = bool(candidate.get("internal_code") and candidate.get("qianchuan_product_id") and candidate.get("qianchuan_plan_id"))
@@ -1098,7 +1119,7 @@ def dashboard(request: Request, status: str = "pending_review", room_id: str = "
         conditions.append("created_at>=? AND created_at<?")
         params.extend(date_range)
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
-    rows = db.all(f"SELECT * FROM highlight_candidates{where} ORDER BY created_at DESC LIMIT 200", params)
+    rows = db.all(f"SELECT * FROM highlight_candidates{where} ORDER BY created_at DESC LIMIT 500", params)
     segment_counts = db.all("SELECT status,COUNT(*) AS count FROM recording_segments GROUP BY status")
     events = db.all("SELECT * FROM service_events ORDER BY id DESC LIMIT 12")
     return templates.TemplateResponse(request, "index.html", {
@@ -2019,6 +2040,32 @@ def cleanup_ready_segments_for_candidate(candidate_id: int) -> dict[str, Any]:
     return cleanup_ready_segments([int(segment["id"]) for segment in segments])
 
 
+def cleanup_ready_segments_for_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run one de-duplicated cleanup pass after a batch disposition/export."""
+    sessions = list(dict.fromkeys(str(candidate.get("session_id") or "") for candidate in candidates))
+    sessions = [session for session in sessions if session]
+    if not sessions:
+        return {"cleaned_count": 0, "cleaned_segment_ids": [], "released_bytes": 0, "released_gb": 0, "blocked": []}
+    placeholders = ",".join("?" for _ in sessions)
+    segments = db.all(
+        f"SELECT * FROM recording_segments WHERE session_id IN ({placeholders}) "
+        "AND status IN ('complete','analyzed') ORDER BY id",
+        sessions,
+    )
+    candidates_by_session: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        candidates_by_session.setdefault(str(candidate.get("session_id") or ""), []).append(candidate)
+    segment_ids = [
+        int(segment["id"])
+        for segment in segments
+        if any(
+            _candidate_overlaps_segment(candidate, segment)
+            for candidate in candidates_by_session.get(str(segment["session_id"]), [])
+        )
+    ]
+    return cleanup_ready_segments(segment_ids)
+
+
 def cleanup_all_ready_segments(limit: int = 100) -> dict[str, Any]:
     rows = db.all(
         "SELECT id FROM recording_segments WHERE status IN ('complete','analyzed') ORDER BY id LIMIT ?",
@@ -2058,9 +2105,7 @@ def serve_media(path: str) -> FileResponse:
     return FileResponse(
         allowed_media(path),
         headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
+            "Cache-Control": "private, max-age=3600",
         },
     )
 
@@ -2130,13 +2175,13 @@ class ReviewRequest(BaseModel):
 
 
 class BatchReviewRequest(BaseModel):
-    candidate_ids: list[int] = Field(min_length=1, max_length=100)
+    candidate_ids: list[int] = Field(min_length=1, max_length=500)
     action: Literal["accept", "reject", "defer"] = "accept"
     reason: str = ""
 
 
 class BatchExportRequest(BaseModel):
-    candidate_ids: list[int] = Field(min_length=1, max_length=100)
+    candidate_ids: list[int] = Field(min_length=1, max_length=500)
 
 
 @app.post("/api/candidates/{candidate_id}/review")
@@ -2195,30 +2240,58 @@ def review_candidate(candidate_id: int, payload: ReviewRequest) -> dict[str, Any
 @app.post("/api/review/batch")
 def batch_review_candidates(payload: BatchReviewRequest) -> dict[str, Any]:
     candidate_ids = list(dict.fromkeys(payload.candidate_ids))
-    candidates = [get_candidate(candidate_id) for candidate_id in candidate_ids]
+    candidates = get_candidates(candidate_ids)
     for candidate in candidates:
-        allowed_statuses = {"pending_review", "accepted", "exported"} if payload.action == "accept" else {"pending_review", "deferred"}
+        allowed_statuses = {"pending_review", "deferred", "accepted", "exported"} if payload.action == "accept" else {"pending_review", "deferred"}
         if candidate["status"] not in allowed_statuses:
             raise HTTPException(409, f"候选 #{candidate['id']} 当前状态不可批量审核")
-    results = []
+
+    desired_status = {"accept": "accepted", "reject": "rejected", "defer": "deferred"}[payload.action]
+    changed: list[dict[str, Any]] = []
     for candidate in candidates:
-        result = review_candidate(candidate["id"], ReviewRequest(
-            action=payload.action,
-            reason=payload.reason,
-        ))
-        results.append(result["candidate"])
-    return {"ok": True, "count": len(results), "candidate_ids": candidate_ids}
+        if payload.action == "accept" and candidate["status"] in {"accepted", "exported"}:
+            continue
+        if candidate["status"] == desired_status:
+            continue
+        changed.append(candidate)
+
+    now = utc_now()
+    if changed:
+        db.execute_many(
+            "UPDATE highlight_candidates SET status=?,catalog_item_id=NULL,updated_at=? WHERE id=?",
+            ((desired_status, now, candidate["id"]) for candidate in changed),
+        )
+        db.execute_many(
+            """INSERT INTO review_decisions
+               (candidate_id,action,reason,start_time,end_time,captions_json,catalog_item_id,candidate_version,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            ((
+                candidate["id"], payload.action, payload.reason,
+                candidate["start_time"], candidate["end_time"], candidate["captions_json"],
+                None, candidate["version"], now,
+            ) for candidate in changed),
+        )
+        db.execute_many(
+            "UPDATE publish_jobs SET status='cancelled',updated_at=? WHERE candidate_id=? AND status NOT IN ('exported','published')",
+            ((now, candidate["id"]) for candidate in changed),
+        )
+    auto_cleanup = cleanup_ready_segments_for_candidates(changed) if payload.action == "reject" else None
+    return {"ok": True, "count": len(candidate_ids), "changed_count": len(changed),
+            "candidate_ids": candidate_ids, "auto_cleanup": auto_cleanup}
 
 
-@app.post("/api/candidates/{candidate_id}/export")
-def export_candidate(candidate_id: int) -> dict[str, Any]:
-    candidate = get_candidate(candidate_id)
+def _export_candidate(
+    candidate_id: int,
+    cleanup_after: bool = True,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    candidate = candidate or get_candidate(candidate_id)
     if candidate["status"] not in {"accepted", "exported"}:
         raise HTTPException(409, "只有已接受的片段可以导出")
     if candidate["status"] == "exported" and candidate.get("output_path") and Path(candidate["output_path"]).exists():
         destination = Path(candidate["output_path"])
         metadata_path = str(destination.with_suffix(".json"))
-        auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id)
+        auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id) if cleanup_after else None
         return {"ok": True, "output_path": candidate["output_path"], "metadata_path": metadata_path,
                 "exported_at": candidate.get("exported_at") or "", "idempotent": True,
                 "auto_cleanup": auto_cleanup}
@@ -2270,26 +2343,39 @@ def export_candidate(candidate_id: int) -> dict[str, Any]:
            media_cleaned_at='',media_released_bytes=0,updated_at=? WHERE id=?""",
         (str(destination), exported_at, exported_at, candidate_id),
     )
-    auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id)
+    auto_cleanup = cleanup_ready_segments_for_candidate(candidate_id) if cleanup_after else None
     return {"ok": True, "output_path": str(destination), "metadata_path": str(metadata_path),
             "exported_at": exported_at, "idempotent": False, "auto_cleanup": auto_cleanup}
+
+
+@app.post("/api/candidates/{candidate_id}/export")
+def export_candidate(candidate_id: int) -> dict[str, Any]:
+    return _export_candidate(candidate_id)
 
 
 @app.post("/api/candidates/batch-export")
 def batch_export_candidates(payload: BatchExportRequest) -> dict[str, Any]:
     candidate_ids = list(dict.fromkeys(payload.candidate_ids))
-    candidates = [get_candidate(candidate_id) for candidate_id in candidate_ids]
+    candidates = get_candidates(candidate_ids)
     for candidate in candidates:
         if candidate["status"] not in {"accepted", "exported"}:
             raise HTTPException(409, f"候选 #{candidate['id']} 尚未审核接受，不能导出")
 
     exported_files: list[tuple[dict[str, Any], Path]] = []
     for candidate in candidates:
-        result = export_candidate(int(candidate["id"]))
+        result = _export_candidate(int(candidate["id"]), cleanup_after=False, candidate=candidate)
         output_path = Path(result["output_path"])
         if not output_path.is_file():
             raise HTTPException(500, f"候选 #{candidate['id']} 的成片生成失败")
-        exported_files.append((get_candidate(int(candidate["id"])), output_path))
+        exported_candidate = dict(candidate)
+        exported_candidate.update({
+            "status": "exported",
+            "output_path": str(output_path),
+            "exported_at": result.get("exported_at") or candidate.get("exported_at") or "",
+        })
+        exported_files.append((exported_candidate, output_path))
+
+    auto_cleanup = cleanup_ready_segments_for_candidates(candidates)
 
     batch_dir = settings.cache_dir / "batch_exports"
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -2333,6 +2419,7 @@ def batch_export_candidates(payload: BatchExportRequest) -> dict[str, Any]:
         "count": len(exported_files),
         "filename": download_name,
         "download_url": f"/api/batch-exports/{token}?count={len(exported_files)}&filename={quote(download_name)}",
+        "auto_cleanup": auto_cleanup,
     }
 
 

@@ -274,6 +274,10 @@ class Database:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_candidates_room_status ON highlight_candidates(room_id,status)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_candidates_room_status_created "
+                "ON highlight_candidates(room_id,status,created_at DESC)"
+            )
             room_columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_rooms)")}
             room_migrations = {
                 "live_status": "TEXT NOT NULL DEFAULT 'unknown'",

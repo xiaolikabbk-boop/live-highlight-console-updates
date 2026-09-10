@@ -4,9 +4,9 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>成片导出</title>
   <link rel="stylesheet" href="/static/app.css?v=20260909-1">
-  <link rel="stylesheet" href="/static/review-grid.css?v=20260813-1">
+  <link rel="stylesheet" href="/static/review-grid.css?v=20260910-1">
   <link rel="stylesheet" href="/static/filter-enhancements.css?v=20260831-1">
-  <link rel="stylesheet" href="/static/export-center.css?v=20260831-3">
+  <link rel="stylesheet" href="/static/export-center.css?v=20260910-1">
 </head>
 <body>
   <header class="topbar">
@@ -68,7 +68,7 @@
         <div class="card-select-row"><label><input class="export-candidate-check" type="checkbox" value="{{ candidate.id }}" onchange="updateExportSelection()"> 选择</label><span>#{{ candidate.id }} · {{ candidate.duration }}秒</span></div>
         <div class="video-panel">
           {% set playable = candidate.output_path if candidate.output_path else candidate.preview_path %}
-          {% if playable %}<video controls preload="metadata" src="/media?path={{ playable|urlencode }}&v={{ candidate.updated_at|urlencode }}"></video>
+          {% if playable %}<video class="lazy-video" controls preload="none" data-src="/media?path={{ playable|urlencode }}&v={{ candidate.updated_at|urlencode }}"></video>
           {% else %}<div class="video-placeholder">本机成片已清理<br>导出记录仍保留</div>{% endif %}
           <div class="score-row"><span>卖点 {{ '%.0f'|format(candidate.sales_score*100) }}</span><span>完整 {{ '%.0f'|format(candidate.coherence_score*100) }}</span><span>商品 {{ '%.0f'|format(candidate.product_score*100) }}</span><span>综合 {{ '%.0f'|format(candidate.confidence*100) }}</span></div>
         </div>
@@ -104,7 +104,9 @@
     function updateExportSelection(){const ids=selectedExportIds(),boxes=[...document.querySelectorAll('.export-candidate-check')];document.getElementById('export-selected-count').textContent=`已选 ${ids.length} 条`;const all=document.getElementById('select-all-export');all.checked=boxes.length>0&&ids.length===boxes.length;all.indeterminate=ids.length>0&&ids.length<boxes.length}
     function toggleAllExports(checked){document.querySelectorAll('.export-candidate-check').forEach(item=>item.checked=checked);updateExportSelection()}
     function selectPendingExports(){document.querySelectorAll('.export-card').forEach(card=>{const waiting=card.querySelector('.export-status.waiting'),check=card.querySelector('.export-candidate-check');if(check)check.checked=!!waiting});updateExportSelection()}
-    async function batchExportZip(){const ids=selectedExportIds(),box=document.getElementById('batch-export-message'),button=document.getElementById('batch-export-button');if(!ids.length){box.textContent='请先勾选要导出的素材';box.className='message error';return}button.disabled=true;box.textContent=`正在把 ${ids.length} 条现成视频放入 ZIP…`;box.className='message';try{const res=await fetch('/api/candidates/batch-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids})});const data=await res.json();if(!res.ok)throw new Error(errorText(data.detail)||'批量导出失败');box.textContent=`ZIP 已生成，正在交给浏览器下载：${data.filename}`;box.className='message success';button.disabled=false;window.location.assign(data.download_url)}catch(error){box.textContent=error.message;box.className='message error';button.disabled=false}}
+    async function batchExportZip(){const ids=selectedExportIds(),box=document.getElementById('batch-export-message'),button=document.getElementById('batch-export-button');if(!ids.length){box.textContent='请先勾选要导出的素材';box.className='message error';return}button.disabled=true;box.textContent=`正在准备 ${ids.length} 条素材并生成 ZIP；已清理的旧成片会自动重新生成…`;box.className='message';try{const res=await fetch('/api/candidates/batch-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids})});const data=await res.json();if(!res.ok)throw new Error(errorText(data.detail)||'批量导出失败');box.textContent=`ZIP 已生成，正在交给浏览器下载：${data.filename}`;box.className='message success';button.disabled=false;window.location.assign(data.download_url)}catch(error){box.textContent=error.message;box.className='message error';button.disabled=false}}
+    function enableLazyVideos(){const videos=[...document.querySelectorAll('video.lazy-video[data-src]')];const load=video=>{if(!video.src){video.preload='metadata';video.src=video.dataset.src;video.removeAttribute('data-src');video.load()}};if(!('IntersectionObserver'in window)){videos.slice(0,12).forEach(load);return}const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){load(entry.target);observer.unobserve(entry.target)}}),{rootMargin:'700px 0px'});videos.forEach(video=>observer.observe(video))}
+    enableLazyVideos()
     if(document.getElementById('select-all-export'))updateExportSelection()
   </script>
 </body></html>

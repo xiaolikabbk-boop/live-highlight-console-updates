@@ -53,3 +53,4 @@
 @media(max-width:1200px){.export-room-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:800px){.export-room-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){.export-room-grid{grid-template-columns:1fr}.selected-room-heading{align-items:flex-start;flex-direction:column}.export-card{grid-template-columns:1fr}.export-card .video-panel video,.export-card .video-placeholder{height:500px}.export-batch-bar{position:static;align-items:stretch;flex-direction:column}.export-batch-bar button{width:100%;margin:0}.export-summary{grid-template-columns:1fr 1fr}.today-output-head{align-items:flex-start;flex-direction:column}.today-output-totals{width:100%}.today-output-totals span{flex:1;justify-content:center}}
+.export-card{content-visibility:auto;contain-intrinsic-size:430px}

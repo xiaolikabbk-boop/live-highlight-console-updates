@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>直播高光审核台</title>
   <link rel="stylesheet" href="/static/app.css?v=20260909-1">
-  <link rel="stylesheet" href="/static/review-grid.css?v=20260813-1">
+  <link rel="stylesheet" href="/static/review-grid.css?v=20260910-1">
   <link rel="stylesheet" href="/static/filter-enhancements.css?v=20260831-1">
 </head>
 <body>
@@ -58,7 +58,7 @@
           <span>#{{ candidate.id }} · {{ candidate.duration }}秒</span>
         </div>
         <div class="video-panel">
-          {% if candidate.preview_path %}<video controls preload="metadata" src="/media?path={{ candidate.preview_path|urlencode }}&v={{ candidate.updated_at|urlencode }}"></video>
+          {% if candidate.preview_path %}<video class="lazy-video" controls preload="none" data-src="/media?path={{ candidate.preview_path|urlencode }}&v={{ candidate.updated_at|urlencode }}"></video>
           {% else %}<div class="video-placeholder">{{ candidate.status }}<br>预览尚未生成</div>{% endif %}
           <div class="score-row"><span>卖点 {{ '%.0f'|format(candidate.sales_score*100) }}</span><span>完整 {{ '%.0f'|format(candidate.coherence_score*100) }}</span><span>商品 {{ '%.0f'|format(candidate.product_score*100) }}</span><span>综合 {{ '%.0f'|format(candidate.confidence*100) }}</span></div>
         </div>
@@ -98,5 +98,7 @@
     function toggleAll(checked){document.querySelectorAll('.candidate-check').forEach(item=>item.checked=checked);updateSelection()}
     async function batchAccept(){const ids=selectedIds(),box=document.getElementById('batch-message');if(!ids.length){box.textContent='请先勾选候选';box.className='message error';return}box.textContent=`正在接受 ${ids.length} 条…`;box.className='message';const res=await fetch('/api/review/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids,action:'accept',reason:document.getElementById('batch-reason').value})});const data=await res.json();if(!res.ok){box.textContent=errorText(data.detail);box.className='message error';return}ids.forEach(id=>document.getElementById(`candidate-${id}`)?.remove());box.textContent=`已接受 ${data.count} 条`;box.className='message success';updateSelection()}
     async function batchDisposition(action){const ids=selectedIds(),box=document.getElementById('batch-message');if(!ids.length){box.textContent='请先勾选候选';box.className='message error';return}const label=action==='reject'?'不需要':'暂存待用';if(action==='reject'&&!confirm(`确认将选中的 ${ids.length} 条标记为“不需要”？这些素材不必打包，并可参与后续安全清理。`))return;box.textContent=`正在标记 ${ids.length} 条为${label}…`;box.className='message';const reason=document.getElementById('batch-reason').value||(action==='reject'?'人工确认不需要':'暂存待用');const res=await fetch('/api/review/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate_ids:ids,action,reason})});const data=await res.json();if(!res.ok){box.textContent=errorText(data.detail);box.className='message error';return}ids.forEach(id=>document.getElementById(`candidate-${id}`)?.remove());box.textContent=`已将 ${data.count} 条标记为${label}`;box.className='message success';updateSelection()}
+    function enableLazyVideos(){const videos=[...document.querySelectorAll('video.lazy-video[data-src]')];const load=video=>{if(!video.src){video.preload='metadata';video.src=video.dataset.src;video.removeAttribute('data-src');video.load()}};if(!('IntersectionObserver'in window)){videos.slice(0,12).forEach(load);return}const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){load(entry.target);observer.unobserve(entry.target)}}),{rootMargin:'700px 0px'});videos.forEach(video=>observer.observe(video))}
+    enableLazyVideos()
   </script>
 </body></html>
