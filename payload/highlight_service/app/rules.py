@@ -6,7 +6,7 @@ from dataclasses import dataclass, asdict
 from typing import Any
 
 
-RULE_VERSION = "commerce-video-rules-2026-08-11-v3"
+RULE_VERSION = "commerce-video-rules-2026-09-19-v4"
 
 
 @dataclass(slots=True)
@@ -57,6 +57,18 @@ HARD_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Phrases observed in Qianchuan rejections. Unlike the older redline rules,
+# these reject the whole punctuation-delimited spoken clause: keeping text on
+# either side of one of these words can retain the same claim in the audio.
+AD_REJECTION_PATTERNS: dict[str, tuple[str, ...]] = {
+    "千川绝对化话术": (
+        r"顶配|首选|最贵|绝无仅有|史无前例|天花板|黑科技|(?:全行业|行业|全国|全球)第一",
+    ),
+    "第三方品牌/人物": (
+        r"爱马仕|迈巴赫|杰尼亚|路易威登|(?<![A-Za-z])L\s*V(?![A-Za-z])|黎明",
+    ),
+}
+
 # These are ordinary product claims in live commerce. They are allowed into a
 # candidate, but surfaced to the reviewer rather than treated as platform-redline
 # words. The operator remains responsible for matching them to the actual item.
@@ -71,7 +83,7 @@ REVIEW_PATTERNS: dict[str, tuple[str, ...]] = {
 def hard_rule_hits(text: str) -> list[str]:
     normalized = re.sub(r"\s+", "", text or "")
     hits: list[str] = []
-    for category, patterns in HARD_PATTERNS.items():
+    for category, patterns in (*HARD_PATTERNS.items(), *AD_REJECTION_PATTERNS.items()):
         if any(re.search(pattern, normalized, re.I) for pattern in patterns):
             hits.append(category)
     return hits
@@ -96,6 +108,10 @@ def _split_redline_fragments(text: str) -> list[str]:
     """
     fragments: list[str] = []
     for piece in _split_text(text) or [text]:
+        if any(re.search(pattern, piece, re.I)
+               for patterns in AD_REJECTION_PATTERNS.values() for pattern in patterns):
+            fragments.append(piece)
+            continue
         intervals: list[tuple[int, int]] = []
         for patterns in HARD_PATTERNS.values():
             for pattern in patterns:

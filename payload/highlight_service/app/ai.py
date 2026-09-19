@@ -247,6 +247,7 @@ class CandidateAnalyzer:
 
     def _sanitize(self, candidates: list[dict[str, Any]], clauses: list[Clause]) -> list[dict[str, Any]]:
         by_id = {clause.id: clause for clause in clauses}
+        blocked_clauses = [clause for clause in clauses if clause.hard_hits]
         clean: list[dict[str, Any]] = []
         for item in candidates[:self.settings.max_candidates_per_window]:
             ids = [str(value) for value in item.get("keep_clause_ids") or []]
@@ -256,11 +257,21 @@ class CandidateAnalyzer:
                 continue
             ranges: list[dict[str, Any]] = []
             for clause in selected:
-                if ranges and clause.start - ranges[-1]["end"] <= self.settings.range_merge_gap_seconds:
+                blocked_gap = ranges and any(
+                    blocked.start < clause.start and blocked.end > ranges[-1]["end"]
+                    for blocked in blocked_clauses
+                )
+                if ranges and not blocked_gap and clause.start - ranges[-1]["end"] <= self.settings.range_merge_gap_seconds:
                     ranges[-1]["end"] = clause.end
                     ranges[-1]["clause_ids"].append(clause.id)
                 else:
                     ranges.append({"start": clause.start, "end": clause.end, "clause_ids": [clause.id]})
+            if any(
+                min(blocked.end, float(source_range["end"]))
+                - max(blocked.start, float(source_range["start"])) > 0.001
+                for blocked in blocked_clauses for source_range in ranges
+            ):
+                continue
             if len(ranges) > self.settings.max_source_ranges:
                 continue
             duration = sum(float(r["end"]) - float(r["start"]) for r in ranges)
